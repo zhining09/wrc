@@ -170,12 +170,18 @@ class SkillRuntime:
         fn = getattr(self, f"skill_{name}", None)
         if fn is None:
             return {"ok": False, "error": f"unknown skill {name!r}"}
-        self._show_status(f"{name}({_short(args)})")
+        invalid_json = "_raw" in args
+        args_text = "invalid JSON" if invalid_json else _short(args)
+        self._show_status(f"{name}({args_text})")
         before = self.trace.save_keyframe(
             self.last_frame.rgb if self.last_frame is not None else None, f"{name}_before"
         )
         t0 = time.monotonic()
         try:
+            if invalid_json:
+                hint = " Use a short, one-sentence summary." if name == "task_done" else ""
+                raise TypeError(f"expected a complete JSON object. Reissue {name}.{hint}")
+
             import contextlib
 
             hold = (
@@ -224,7 +230,7 @@ class SkillRuntime:
         self._show_status(f"{name} -> " + ("ok" if result["ok"] else err[:60]))
         self.memory.add(
             "action" if result["ok"] else "outcome",
-            f"{name}({_short(args)}) -> " + ("ok" if result["ok"] else err[:120]),
+            f"{name}({args_text}) -> " + ("ok" if result["ok"] else err[:120]),
         )
         return result
 
@@ -1200,7 +1206,7 @@ class SkillRuntime:
         *,
         q_target: np.ndarray | None = None,
         where: str = "",
-    ) -> bool:
+    ) -> None:
         """Wrap ``bridge.move_to_traj`` with pre-motion ``harness.vet_pose`` check.
 
         The bridge path bypasses ``SafeArm``'s per-waypoint approval
@@ -1243,42 +1249,70 @@ class SkillRuntime:
                     f"{where} target unsafe: {reason} (q={q_target.round(3).tolist()})"
                 )
 
-        ok = self.bridge.move_to_traj(*target_6d, duration=duration)
-        if ok and not _is_mock(self.bridge) and not _is_mock(self.arm):
-            # 2026-08-13: post-move FK verify. ``bridge.move_to_traj`` can
-            # return True without actually moving (SDK silent fail --
-            # dashboard shows arm parked at the prior pose while the skill
-            # reports success). Re-FK and compare actual TCP to the
-            # commanded Cartesian target. >2 cm error means the move did
-            # not really happen; surface it as a False return so the
-            # caller's return-value check (or try/except) can react.
-            #
-            # Skip when either ``self.bridge`` or ``self.arm`` is a Mock
-            # (unit-test fixture): the mocked bridge returns True without
-            # driving the mock arm, so the FK comparison always shows the
-            # arm parked at the initial state and would spuriously fail
-            # every test. Production paths use a real ``RebotGraspBridge``
-            # + ``SafeArm`` / ``MockArm`` and run the verify normally.
-            try:
-                final_q = self.arm.get_state().q
-                final_tcp = self.kin.fk(final_q)
-                T_target = np.asarray(target_6d[:3], dtype=float)
-                err_m = float(np.linalg.norm(final_tcp[:3, 3] - T_target))
-                if err_m > 0.02:
-                    self.memory.add(
-                        "note",
-                        f"{where} post-move FK verify FAILED: TCP off by "
-                        f"{err_m*1000:.0f} mm; "
-                        f"target={target_6d[:3]} actual="
-                        f"{final_tcp[:3, 3].round(3).tolist()} (SDK silent fail)",
-                    )
-                    return False
-            except Exception as e:
-                self.memory.add(
-                    "note",
-                    f"{where} post-move FK verify raised {type(e).__name__}: {e}",
-                )
-        return ok
+        pose = f"target XYZ={target_6d[:3]} m, RPY={target_6d[3:]} rad"
+        if not self.bridge.move_to_traj(*target_6d, duration=duration):
+            reason = getattr(self.bridge, "motion_error", None)
+            if not isinstance(reason, str):
+                reason = "SDK did not complete the trajectory"
+            raise SkillError(f"{where} move failed ({pose}): {reason}")
+
+        if not _is_mock(self.bridge) and not _is_mock(self.arm):
+            self._verify_bridge_endpoint(target_6d, pose, where)
+
+    def _verify_bridge_endpoint(
+        self, target_6d: tuple[float, ...], pose: str, where: str,
+    ) -> None:
+        target_xyz = np.asarray(target_6d[:3], dtype=float)
+        read_target = getattr(self.bridge, "get_commanded_joints", None)
+        q_commanded = read_target() if callable(read_target) else None
+        deadline = time.monotonic() + 0.4
+        first_error_mm = None
+        try:
+            while True:
+                q_feedback = self.arm.get_state().q
+                if not np.all(np.isfinite(q_feedback)):
+                    raise ValueError("non-finite joint feedback")
+                xyz_feedback = self.kin.fk(q_feedback)[:3, 3]
+                delta_mm = (xyz_feedback - target_xyz) * 1000.0
+                error_mm = float(np.linalg.norm(delta_mm))
+                if not np.isfinite(error_mm):
+                    raise ValueError("non-finite TCP feedback")
+                if error_mm <= 20.0:
+                    if first_error_mm is not None:
+                        self.memory.add(
+                            "note",
+                            f"{where} TCP feedback entered tolerance after sending "
+                            f"({first_error_mm:.1f} -> {error_mm:.1f} mm)",
+                        )
+                    return
+                if first_error_mm is None:
+                    first_error_mm = error_mm
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.05, remaining))
+        except Exception as e:
+            raise SkillError(
+                f"{where} post-move FK verification failed ({pose}, SDK sender completed): "
+                f"{type(e).__name__}: {e}"
+            ) from e
+
+        commanded = ""
+        if isinstance(q_commanded, np.ndarray):
+            xyz_commanded = self.kin.fk(q_commanded)[:3, 3]
+            plan_delta = (xyz_commanded - target_xyz) * 1000.0
+            tracking_delta = (xyz_feedback - xyz_commanded) * 1000.0
+            commanded = (
+                f", q_commanded={q_commanded.round(5).tolist()} rad, "
+                f"commanded minus target XYZ={plan_delta.round(2).tolist()} mm, "
+                f"feedback minus commanded XYZ={tracking_delta.round(2).tolist()} mm"
+            )
+        raise SkillError(
+            f"{where} post-move FK verify failed ({pose}, SDK sender completed): "
+            f"TCP off by {error_mm:.1f} mm (initially {first_error_mm:.1f} mm, limit 20 mm), "
+            f"feedback minus target XYZ={delta_mm.round(2).tolist()} mm, "
+            f"q_feedback={q_feedback.round(5).tolist()} rad{commanded}"
+        )
 
     def _grasp_to_6d(self, grasp) -> tuple[tuple[float, ...], tuple[float, ...]]:
         """Convert a ``Grasp`` into ``(pre6d, grasp6d)`` for ``bridge.move_to_traj``.
@@ -1374,8 +1408,8 @@ class SkillRuntime:
             [Step5] return to ready  (wrc_demo home_q FK)
 
         The destination label is resolved via ``_single_localize`` on the
-        SAME frame as the object — set.py's YOLO pass produces both
-        detections in one inference. This sidesteps the WorldWatcher
+        SAME frame as the object, with a detector query for each label.
+        This sidesteps the WorldWatcher
         belief-fusion cache (the 3 Hz watcher might serve a stale box
         position from seconds ago).
 
@@ -1387,39 +1421,23 @@ class SkillRuntime:
         """
         import pinocchio as pin
 
-        # ── [Step1] detect destination (box) ──────────────────────────────
-        # When already_held, the arm already has the object — skip pick
-        # phase entirely and go straight to place (matches set.py Step4).
         ready6d = self._ready_pose_6d()
         ready_dur = self._ready_duration()
 
+        # Resolve both poses on one frame before any motion. A held object
+        # only needs the destination to be localized.
+        frame = self.observe()
+        if not already_held:
+            banana_fix = self._single_localize(frame, object_label)
+        box_fix = self._single_localize(frame, destination)
+
         if already_held:
-            # Object is already in the gripper; only need to find the box.
-            frame = self.observe()
-            box_fix = self._single_localize(frame, destination)
-            if box_fix is None:
-                raise SkillError(
-                    f"no {destination!r} detected in current frame "
-                    "(bridge path requires live box detection)"
-                )
             self.memory.add(
                 "note",
                 f"already holding {already_held!r} -- skipping pick, "
                 f"going straight to place on {destination!r}",
             )
         else:
-            # ── Full pick phase (same-frame detect + grasp) ─────────────
-            frame = self.observe()
-            banana_fix = self._single_localize(frame, object_label)
-            if banana_fix is None:
-                raise SkillError(f"no {object_label!r} detected in current frame")
-            box_fix = self._single_localize(frame, destination)
-            if box_fix is None:
-                raise SkillError(
-                    f"no {destination!r} detected in current frame "
-                    "(bridge path requires live box detection)"
-                )
-
             # ── [Step2] pick the object (use the same grasp pipeline as
             # _skill_grasp_object_bridge, but inline so the held-detection
             # bookkeeping lines up with the place stage below).
@@ -1445,20 +1463,10 @@ class SkillRuntime:
             pre6d, grasp6d = self._grasp_to_6d(grasp)
 
             # Move to ready_pose first (matches set.py _move_ready).
-            if not self._safe_bridge_move(ready6d, duration=ready_dur, where="ready"):
-                raise SkillError(
-                    f"ready move failed (target="
-                    f"{[round(ready6d[0],3), round(ready6d[1],3), round(ready6d[2],3)]}, "
-                    f"q_target unsafe or SDK silent fail)"
-                )
+            self._safe_bridge_move(ready6d, duration=ready_dur, where="ready")
 
             self.bridge.open_gripper()
-            if not self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp"):
-                raise SkillError(
-                    f"pregrasp move failed (target="
-                    f"{[round(pre6d[0],3), round(pre6d[1],3), round(pre6d[2],3)]}, "
-                    f"q_target unsafe or SDK silent fail)"
-                )
+            self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp")
 
             # Open a grasp-exemption cylinder centered on the grasp XY for
             # the descent motion (matches _skill_grasp_object_bridge).
@@ -1471,12 +1479,7 @@ class SkillRuntime:
                     radius=float(self.cfg.grasp.get("exempt_radius_m", 0.07)),
                     z_min=float(self.arm.harness.limits.table_z) - 0.06,
                 )
-                if not self._safe_bridge_move(grasp6d, duration=1.5, where="grasp"):
-                    raise SkillError(
-                        f"grasp move failed (target="
-                        f"{[round(grasp6d[0],3), round(grasp6d[1],3), round(grasp6d[2],3)]}, "
-                        f"q_target unsafe or SDK silent fail)"
-                    )
+                self._safe_bridge_move(grasp6d, duration=1.5, where="grasp")
                 ok = self.bridge.grasp(force=1.0)
                 # 2026-08-11: trust the gripper (see the long comment in
                 # _skill_grasp_object_bridge above). The MIT stall
@@ -1541,15 +1544,10 @@ class SkillRuntime:
 
         placed_ok = False
         try:
-            if not self._safe_bridge_move(
+            self._safe_bridge_move(
                 (drop[0], drop[1], drop[2], 0.0, 1.2, 0.0),
                 duration=2.0, where="place",
-            ):
-                raise SkillError(
-                    f"place move failed (drop="
-                    f"{[round(drop[0],3), round(drop[1],3), round(drop[2],3)]}, "
-                    f"q_target unsafe or SDK silent fail)"
-                )
+            )
 
             # ── [Step4b] release + async close (set.py pattern) ────────
             release_thread = self.bridge.release_with_async_close(
@@ -1614,10 +1612,8 @@ class SkillRuntime:
         """Detect + 3D fix on the supplied frame only (no retry / no cache).
 
         Bypasses :meth:`_localize`'s multi-frame retry and WorldWatcher
-        fallback. Used by :meth:`_skill_pick_and_place_bridge` to detect
-        the object AND destination on the same frame in one YOLO pass.
-
-        Returns ``None`` on failure (caller decides how to surface).
+        fallback. A failed query raises ``SkillError`` with the underlying
+        localization reason and the frame used by the skill.
         """
         r = self._resolve_query(query)
         try:
@@ -1627,8 +1623,10 @@ class SkillRuntime:
                 color=r["color"], near_xyz=r["near_xyz"], vocab=r["vocab"],
                 prefer_label=r["prefer_label"],
             )
-        except SkillError:
-            return None
+        except SkillError as e:
+            raise SkillError(
+                f"{e} (frame_id={frame.frame_id}, depth_source={frame.depth_source})"
+            ) from e
 
     def _close_two_stage(
         self,
@@ -2248,7 +2246,7 @@ TOOL_SPECS: list[dict] = [
     },
     {
         "name": "task_done",
-        "description": "Declare task finished with success bool and one-paragraph summary. ALWAYS call last.",
+        "description": "Declare task finished with success bool and a short, one-sentence summary. ALWAYS call last.",
         "parameters": {
             "type": "object",
             "properties": {

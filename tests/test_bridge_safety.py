@@ -10,6 +10,7 @@ preceded by a ``harness.vet_pose(q_target)`` call. vet_pose failures
 must raise ``SafetyViolation`` (not just return False).
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -136,6 +137,67 @@ def test_ik_failure_raises_skill_error():
             rt.skill_grasp_object("banana")
 
     bridge.move_to_traj.assert_not_called()
+
+
+def test_grasp_stops_before_descent_on_pregrasp_send_failure():
+    bridge = MagicMock()
+    bridge.move_to_traj.side_effect = [True, False]
+    bridge.motion_error = "SDK send thread timed out"
+    rt = _runtime_with_bridge(bridge)
+
+    with patch(
+        "wrc_demo.skills.runtime.select_grasp",
+        return_value=(_grasp_pose(), np.zeros(6), np.zeros(6)),
+    ):
+        result = rt.execute("grasp_object", {"label": "banana"})
+
+    assert not result["ok"]
+    assert "pregrasp move failed" in result["error"]
+    assert "send thread timed out" in result["error"]
+    rt.arm.harness.allow_grasp_descent.assert_not_called()
+    bridge.grasp.assert_not_called()
+
+
+@pytest.mark.parametrize("settles", [True, False])
+def test_bridge_endpoint_verification_compares_command_and_feedback(settles):
+    target = (0.3, -0.22, 0.135, 0.0, 1.2, 0.0)
+    commanded = np.zeros(6)
+    feedback = np.ones(6)
+    arm = SimpleNamespace(
+        harness=None,
+        get_state=MagicMock(side_effect=[
+            SimpleNamespace(q=feedback),
+            SimpleNamespace(q=commanded if settles else feedback),
+        ]),
+    )
+    bridge = SimpleNamespace(
+        move_to_traj=MagicMock(return_value=True),
+        get_commanded_joints=MagicMock(return_value=commanded),
+    )
+    rt = _runtime_with_bridge(bridge)
+    rt.arm = arm
+
+    def fk(q):
+        pose = np.eye(4)
+        pose[:3, 3] = target[:3]
+        pose[2, 3] += 0.022 * q[0]
+        return pose
+
+    rt.kin.fk.side_effect = fk
+    fake_time = SimpleNamespace(
+        monotonic=MagicMock(side_effect=[0.0, 0.01, 0.41]),
+        sleep=MagicMock(),
+    )
+    with patch("wrc_demo.skills.runtime.time", fake_time):
+        if settles:
+            rt._safe_bridge_move(target, 2.0, q_target=commanded, where="pregrasp")
+        else:
+            with pytest.raises(SkillError, match="TCP off by 22.0 mm") as exc:
+                rt._safe_bridge_move(target, 2.0, q_target=commanded, where="pregrasp")
+            assert "commanded minus target XYZ=[0.0, 0.0, 0.0]" in str(exc.value)
+            assert "feedback minus commanded XYZ=[0.0, 0.0, 22.0]" in str(exc.value)
+
+    assert arm.get_state.call_count == 2
 
 
 def test_pick_and_place_bridge_vet_pose_each_move():

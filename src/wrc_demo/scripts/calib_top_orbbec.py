@@ -1,4 +1,4 @@
-"""CLI: hand-eye calibration for the Orbbec top camera.
+"""CLI: hand-eye calibration for a fixed overhead RGB-D camera.
 
 Schema version: 1
 Frame convention: wrc_demo (base +x away from robot, +y left, TCP = gripper_end)
@@ -11,14 +11,13 @@ Architecture ported from rebot_grasp/scripts/calibrate_top_camera.py:
   so the operator can hand-guide the arm during manual capture (uses
   vendored ``RebotArm`` directly, matching the pattern in
   ``skills/teach.py`` -- see CLAUDE.md "Motion safety path").
-- Reuses wrc_demo's ``OrbbecCamera``, ``Kinematics``, ``joint_solve_restart``
+- Reuses wrc_demo's camera backends, ``Kinematics``, ``joint_solve_restart``
   + ``save_calibration`` (no rebot_grasp dependency).
 
 Sub-commands:
 
-- ``--list``: enumerate Orbbec devices (no frames captured).
-- ``--bind <role>``: write the role -> serial binding into
-  ``data/calibration/cameras.json`` (also updates profile YAMLs).
+- ``--list``: enumerate devices for the selected camera backend.
+- ``--bind <role>``: save the serial in the camera profile.
 - ``--verify --npz <file> --known-points <csv>``: cross-check a saved
   calibration against operator-measured table points.
 - ``--dry-run``: synthesize samples and exercise solve/persist pipeline
@@ -27,8 +26,8 @@ Sub-commands:
   after each pose (operator moves arm by hand); ``--gravity-comp`` adds
   MIT-mode gravity compensation so the arm floats during manual capture.
 
-Output: ``data/calibration/hand_eye_top.json`` (schema v1) + ``.npz``
-sidecar -- loadable by ``scripts/flip_hand_eye.py`` and
+Output: the selected camera profile’s ``extrinsics.source`` JSON (schema v1)
+with an ``.npz`` sidecar -- loadable by ``scripts/flip_hand_eye.py`` and
 ``scripts/verify_relative_motion.py``.
 
 Run via ``python -m wrc_demo.scripts.calib_top_orbbec ...`` (editable
@@ -39,8 +38,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import importlib.util
 import json
 import queue
+import re
 import signal as _signal
 import sys
 import threading
@@ -62,9 +63,12 @@ from ..calibration import (
     load_calibration,
     save_calibration,
 )
-from ..config import PACKAGE_ROOT
+from .. import config
+from ..config import Cfg, PACKAGE_ROOT, load_profile, load_real_camera_profile_name
 from ..safety.harness import Kinematics
-from ..perception.orbbec_camera import OrbbecCamera, list_orbbec_devices
+from ..perception.camera_base import CameraBase, make_camera
+from ..perception.orbbec_camera import list_orbbec_devices
+from ..perception.realsense_camera import list_realsense_devices
 from ._calib_cleanup import safe_park_and_disconnect
 
 
@@ -506,101 +510,74 @@ def _register_process_cleanup(cleanup: Callable[[], None]) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _print_devices() -> int:
+def _list_devices(camera_cfg: Cfg) -> list[dict]:
+    if camera_cfg.type == "orbbec":
+        return list_orbbec_devices()
+    return list_realsense_devices(camera_cfg.get("device_model"))
+
+
+def _print_devices(camera_cfg: Cfg) -> int:
+    camera_type = camera_cfg.type
     try:
-        devices = list_orbbec_devices()
+        devices = _list_devices(camera_cfg)
     except Exception as e:
         print(f"[calib] enumerate failed: {e}", file=sys.stderr)
         return 2
     if not devices:
-        print("[calib] no Orbbec devices found")
+        print(f"[calib] no {camera_type} devices found")
         return 1
-    for d in devices:
-        print(
-            f"  [{d.get('index', '?')}] {d.get('name', '?')} "
-            f"serial={d.get('serial', '?')} "
-            f"pid={d.get('pid', '?')} vid={d.get('vid', '?')}"
-        )
+    for device in devices:
+        details = f" pid={device.get('pid', '?')} vid={device.get('vid', '?')}" if camera_type == "orbbec" else ""
+        print(f"  [{device['index']}] {device.get('name', '?')} serial={device.get('serial', '?')}{details}")
     return 0
 
 
-def _bind_role(role: str, serial: str | None = None, index: int | None = None) -> int:
-    """Persist role -> serial in ``cameras.json``. If ``serial`` is omitted
-    we use the first enumerated device whose index matches ``--index``.
-    """
-    role = role.lower()
-    if role not in {"top", "wrist"}:
-        print(f"[calib] bind: role must be 'top' or 'wrist', got {role!r}", file=sys.stderr)
-        return 2
+def _save_orbbec_binding(role: str, serial: str, index: int | None) -> None:
     CALIB_DIR.mkdir(parents=True, exist_ok=True)
-    p = CALIB_DIR / "cameras.json"
-    existing = (
-        CamerasBinding.from_json(json.loads(p.read_text())) if p.exists() else CamerasBinding()
-    )
-    if serial is None:
-        devices = list_orbbec_devices()
-        if not devices:
-            print("[calib] bind: no Orbbec devices to bind", file=sys.stderr)
-            return 1
-        idx = index if index is not None else 0
-        if idx < 0 or idx >= len(devices):
-            print(f"[calib] bind: index {idx} out of range (0..{len(devices) - 1})", file=sys.stderr)
-            return 1
-        serial = str(devices[idx].get("serial", ""))
-        index = int(devices[idx].get("index", idx))
+    path = CALIB_DIR / "cameras.json"
+    existing = CamerasBinding.from_json(json.loads(path.read_text())) if path.exists() else CamerasBinding()
     binding = CameraBinding(serial=serial, index_when_bound=index if index is not None else -1)
-    if role == "top":
-        updated = CamerasBinding(
-            top=binding,
-            wrist=existing.wrist,
-            updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        )
+    updated = CamerasBinding(
+        top=binding if role == "top" else existing.top,
+        wrist=binding if role == "wrist" else existing.wrist,
+        updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+    path.write_text(json.dumps(updated.to_json(), indent=2, sort_keys=True))
+
+
+def _bind_role(role: str, profile: str, camera_cfg: Cfg, serial: str | None, index: int | None) -> int:
+    if serial is None:
+        devices = _list_devices(camera_cfg)
+        if not devices:
+            print(f"[calib] bind: no {camera_cfg.type} devices found", file=sys.stderr)
+            return 1
+        index = index if index is not None else 0
+        if not 0 <= index < len(devices):
+            print(f"[calib] bind: index {index} out of range (0..{len(devices) - 1})", file=sys.stderr)
+            return 2
+        serial = devices[index].get("serial")
+        if not serial:
+            print("[calib] bind: device did not report a serial", file=sys.stderr)
+            return 2
+
+    path = config.CONFIG_DIR / "cameras" / f"{profile}.yaml"
+    text = path.read_text()
+    line = f"serial: {json.dumps(serial)}"
+    if re.search(r"^serial:.*$", text, re.MULTILINE):
+        text = re.sub(r"^serial:.*$", lambda _: line, text, count=1, flags=re.MULTILINE)
     else:
-        updated = CamerasBinding(
-            top=existing.top,
-            wrist=binding,
-            updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        )
-    p.write_text(json.dumps(updated.to_json(), indent=2, sort_keys=True))
-    print(f"[calib] bound {role} -> serial={serial} (index {binding.index_when_bound}); wrote {p}")
-    # Best-effort: also patch the matching profile YAML so the rig boots
-    # straight into the right device without manual editing.
-    profile_map = {"top": "orbbec_overhead", "wrist": "orbbec_wrist"}
-    prof = PACKAGE_ROOT / "configs" / "cameras" / f"{profile_map[role]}.yaml"
-    if prof.exists():
-        text = prof.read_text()
-        if "\nserial:" in text:
-            lines = text.splitlines()
-            for k, line in enumerate(lines):
-                if line.startswith("serial:"):
-                    lines[k] = f'serial: "{serial}"'
-                    break
-            else:
-                lines.append(f'serial: "{serial}"')
-            prof.write_text("\n".join(lines) + "\n")
-            print(f"[calib] patched {prof.name}: serial={serial!r}")
+        text = f"{text.rstrip()}\n{line}\n"
+    path.write_text(text)
+    # The wrist calibrator and older Orbbec installations also read this file.
+    if profile in ("orbbec_overhead", "orbbec_wrist"):
+        _save_orbbec_binding(role, serial, index)
+    print(f"[calib] bound {role} -> serial={serial} in {path}")
     return 0
 
 
-def _open_orbbec(serial: str, width: int, height: int, fps: int) -> OrbbecCamera:
-    from ..config import Cfg
-    from ..perception.camera_base import CameraError
-
-    cfg = Cfg({
-        "type": "orbbec",
-        "serial": serial,
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "min_depth_m": 0.25,
-        "max_depth_m": 2.5,
-    })
-    cam = OrbbecCamera(cfg)
-    try:
-        cam.open()
-    except CameraError as e:
-        print(f"[calib] camera open failed: {e}", file=sys.stderr)
-        raise
+def _open_camera(cfg: Cfg) -> CameraBase:
+    cam = make_camera(cfg)
+    cam.open()
     return cam
 
 
@@ -1117,29 +1094,21 @@ def _collect_loop_auto(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _read_arm_q(serial: str | None = None) -> Optional[np.ndarray]:
-    """Read the current arm joint state from the rebot_rs arm.
-
-    Lazy import so the script is runnable on the dry-run path (no arm).
-    Returns ``None`` if the arm isn't connected; the caller decides how
-    to handle that (skip vs synthetic).
-
-    Tests ``monkeypatch.setattr(cli, "_read_arm_q", ...)`` this -- the
-    public symbol must stay importable from ``calib_top_orbbec``.
-    """
+def _read_arm_q(arm_profile: str = ARM_PROFILE_DEFAULT) -> Optional[np.ndarray]:
+    """Read RobStride joint positions without enabling the motors."""
     try:
-        from ..control.rebot_rs_arm import RebotRSArm  # type: ignore
-    except Exception:
-        return None
-    try:
-        arm = RebotRSArm.__new__(RebotRSArm)  # bypass __init__ state checks
-        # Minimal state to read .get_state(): see rebot_rs_arm.__init__.
-        # If the arm can't be probed, just return None (dry-run path).
-        from ..safety.harness import SafetyLimits
+        from ..control.rebot_rs_arm import MECH_POS
+        arm_cfg = load_profile("arms", arm_profile)
+        _ensure_sdk_on_path(arm_cfg.get("sdk_path") or str(PACKAGE_ROOT / "sdk"))
+        from reBotArm_control_py.actuator import RebotArm
+
+        arm = RebotArm(hw_yaml=arm_cfg.get("hw_yaml", "rebotarm_rs.yaml"))
         arm.connect()
-        st = arm.get_state()
-        arm.disconnect()
-        return np.asarray(st.q[:6], dtype=float)
+        try:
+            group = arm.arm
+            return np.asarray([group._mm[name].robstride_get_param_f32(MECH_POS) for name in group.joint_names])
+        finally:
+            arm.disconnect()
     except Exception as e:
         print(f"[calib] arm read failed: {e}", file=sys.stderr)
         return None
@@ -1155,9 +1124,8 @@ def _collect_loop_manual(
     """Manual mode: operator moves arm + presses ENTER; we wait for a
     stable ArUco detection and record one sample per pose.
 
-    ``arm_q_provider`` is an optional callable returning the current
-    joint vector. If None (or returns None on failure), we fall back to
-    ``_read_arm_q()`` and ultimately to a synthetic seed (dry-run-style).
+    ``arm_q_provider`` can supply measured joint positions. Skip samples
+    for which the arm does not report usable positions.
     """
     finish_reason = "operator finished"
     for i in range(n_target):
@@ -1190,15 +1158,14 @@ def _collect_loop_manual(
             except Exception:
                 q = None
         else:
-            q = _read_arm_q(cam.serial if cam is not None else None)
-        if q is None:
-            print(
-                "[calib] cannot read arm state (no rebot_rs connection); "
-                "saving synthetic FK from a deterministic seed for "
-                "dry-run only", file=sys.stderr,
-            )
-            q = np.zeros(6)
-            q[0] = 0.30 + 0.05 * i
+            q = _read_arm_q()
+        if q is None or not np.all(np.isfinite(q)):
+            print(f"[calib] sample {i + 1}: cannot read arm state, skipping", file=sys.stderr)
+            trace.write(json.dumps({
+                "event": "sample_skipped", "i": i,
+                "ts": time.time(), "reason": "no_arm_q",
+            }) + "\n")
+            continue
         G = kin.fk(q)
         sample = CalibrationSample(
             pose_label=f"manual_{i + 1}",
@@ -1343,6 +1310,7 @@ def _collect_samples(
     manual: bool = False,
     show_window: bool = True,
     gravity_comp: bool = False,
+    camera_cfg: Cfg | None = None,
 ) -> tuple[list[CalibrationSample], str]:
     """Collect ``n_target`` calibration samples.
 
@@ -1366,9 +1334,14 @@ def _collect_samples(
     """
     kin = _make_kinematics()
     aruco = ArUcoSession(dict_name=aruco_dict)
-    cam = _open_orbbec(serial or "", width, height, fps)
-    K = cam.K
-    D = cam.D
+    camera_options = camera_cfg.as_dict() if camera_cfg is not None else {"type": "orbbec"}
+    camera_options.update(serial=serial, width=width, height=height, fps=fps)
+    cam = _open_camera(Cfg(camera_options))
+    try:
+        K, D = cam.K, cam.D
+    except Exception:
+        cam.close()
+        raise
     print(
         f"[calib] camera open: serial={cam.serial} K={K.tolist() if K is not None else None}",
         file=sys.stderr,
@@ -1395,8 +1368,7 @@ def _collect_samples(
             except Exception:
                 pass
 
-    # Arm connection (auto mode only). Manual mode still tries to read q
-    # for FK, but if that fails (no arm) we fall back to a synthetic seed.
+    # Auto mode connects the motion controller; manual mode reads feedback.
     safe_arm = None
     if not manual:
         can_diag = _diagnose_can_bus()
@@ -1511,8 +1483,10 @@ def _collect_samples(
                     n_target=n_target, marker_size_m=marker_size_m,
                     settle_time=settle_time, marker_timeout=marker_timeout,
                     stable_frames=stable_frames, samples=samples, trace=trace,
-                    arm_q_provider=(lambda: np.asarray(safe_arm.get_state().q[:6], dtype=float)
-                                    if safe_arm is not None else None),
+                    arm_q_provider=lambda: (
+                        np.asarray(safe_arm.get_state().q[:6], dtype=float)
+                        if safe_arm is not None else _read_arm_q(arm_profile)
+                    ),
                 )
         else:
             samples, finish_reason = _collect_loop_auto(
@@ -1770,12 +1744,13 @@ def make_input_thread(line_queue: queue.Queue) -> threading.Thread:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--camera", help="overhead camera profile (overrides demo.yaml camera.profile)")
     p.add_argument("--list", action="store_true",
-                   help="enumerate Orbbec devices and exit")
+                   help="enumerate devices for the selected camera backend and exit")
     p.add_argument("--bind", choices=["top", "wrist"], default=None,
-                   help="bind role -> serial, write data/calibration/cameras.json")
+                   help="save the selected serial to the camera profile")
     p.add_argument("--serial", default=None,
-                   help="Orbbec serial to bind/use (skips enumeration)")
+                   help="camera serial to bind or use for this calibration")
     p.add_argument("--index", type=int, default=None,
                    help="device index to pick when enumerating")
     p.add_argument("--arm-profile", default=ARM_PROFILE_DEFAULT)
@@ -1789,12 +1764,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--marker-timeout", type=float, default=4.0,
                    help="max seconds to wait for a stable marker detection")
     p.add_argument("--stable-frames", type=int, default=4)
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
-    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--width", type=int, help="override the camera profile’s width")
+    p.add_argument("--height", type=int, help="override the camera profile’s height")
+    p.add_argument("--fps", type=int, help="override the camera profile’s fps")
     p.add_argument("--n", type=int, default=15,
                    help="target number of calibration samples")
-    p.add_argument("--out", default=str(CALIB_DIR / "hand_eye_top.json"))
+    p.add_argument("--out", help="override the camera profile’s extrinsics.source JSON path")
     p.add_argument("--verify", action="store_true",
                    help="verify a saved calibration against known points")
     p.add_argument("--npz", default=None,
@@ -1817,12 +1792,6 @@ def main(argv: list[str] | None = None) -> int:
                         "arm aren't reachable.")
     args = p.parse_args(argv)
 
-    if args.list:
-        return _print_devices()
-
-    if args.bind is not None:
-        return _bind_role(args.bind, serial=args.serial, index=args.index)
-
     if args.verify:
         if not args.npz:
             print("--verify requires --npz", file=sys.stderr)
@@ -1842,9 +1811,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         out_p = Path(args.dry_run_out)
-        if out_p.resolve() == Path(args.out).resolve():
+        camera_cfg = load_profile("cameras", args.camera or load_real_camera_profile_name())
+        configured_output = camera_cfg.get("extrinsics", Cfg({})).get("source")
+        calibration_paths = [Path(path).resolve() for path in (args.out, configured_output) if path]
+        if out_p.with_suffix(".json").resolve() in [path.with_suffix(".json") for path in calibration_paths]:
             print(
-                f"[calib] --dry-run-out must differ from --out ({args.out})",
+                "[calib] --dry-run-out must differ from the real calibration output",
                 file=sys.stderr,
             )
             return 2
@@ -1868,13 +1840,40 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0 if per_sample_mm < 1.0 else 1
 
+    profile = args.camera or ("orbbec_wrist" if args.bind == "wrist" else load_real_camera_profile_name())
+    camera_cfg = load_profile("cameras", profile)
+    if camera_cfg.type not in ("orbbec", "realsense"):
+        p.error(f"top calibration requires an Orbbec or RealSense profile, got {profile!r}")
+    if args.list:
+        return _print_devices(camera_cfg)
+    if args.bind is not None:
+        return _bind_role(args.bind, profile, camera_cfg, args.serial, args.index)
+
+    extrinsics = camera_cfg.get("extrinsics", Cfg({}))
+    if extrinsics.get("mode", "eye_to_hand") != "eye_to_hand":
+        p.error(f"top calibration requires a fixed camera profile, got {profile!r}")
+    source = args.out or extrinsics.get("source")
+    if not source or (not args.out and Path(source).suffix != ".json"):
+        p.error(f"set a JSON extrinsics.source for {profile!r} or pass --out PATH.json")
+    out_json = Path(source)
+    if importlib.util.find_spec("scipy") is None:
+        p.error("hand-eye calibration needs SciPy; run python -m pip install scipy in wrc-demo")
+
     # Default: collect samples.
     if args.gravity_comp:
         # gc mode implies manual capture (operator presses ENTER per
         # pose, but the arm is gravity-compensated so it floats).
         args.manual = True
 
-    serial = args.serial or _get_serial_from_binding("top") or ""
+    serial = args.serial or camera_cfg.get("serial")
+    if not serial and profile == "orbbec_overhead":
+        serial = _get_serial_from_binding("top")
+    if not serial:
+        devices = _list_devices(camera_cfg)
+        if len(devices) != 1 or not devices[0].get("serial"):
+            p.error("connect one camera or specify its serial with --serial or --bind top")
+        serial = devices[0]["serial"]
+    print(f"[calib] profile={profile} serial={serial} output={out_json}")
     samples, finish_reason = _collect_samples(
         n_target=args.n,
         marker_size_m=args.marker_size,
@@ -1883,15 +1882,16 @@ def main(argv: list[str] | None = None) -> int:
         marker_timeout=args.marker_timeout,
         stable_frames=args.stable_frames,
         serial=serial or None,
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        out_json=Path(args.out),
+        width=args.width if args.width is not None else camera_cfg.get("width", 1280),
+        height=args.height if args.height is not None else camera_cfg.get("height", 720),
+        fps=args.fps if args.fps is not None else camera_cfg.get("fps", 30),
+        out_json=out_json,
         trace_log=PACKAGE_ROOT / "runs" / f"calibration_{int(time.time())}.jsonl",
         arm_profile=args.arm_profile,
         manual=args.manual,
         show_window=not args.manual,  # auto-mode uses cv2.imshow; manual doesn't
         gravity_comp=args.gravity_comp,
+        camera_cfg=camera_cfg,
     )
     print(f"[calib] session ended: {finish_reason}")
     if len(samples) < 4:
@@ -1900,7 +1900,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _solve_and_persist(
         samples,
-        out_json=Path(args.out),
+        out_json=out_json,
         marker_size_m=args.marker_size,
         aruco_dict=args.aruco_dict,
         aruco_marker_id=args.aruco_marker_id,

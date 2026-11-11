@@ -132,7 +132,7 @@ def test_collect_samples_dry_run(tmp_path):
     trace_log = tmp_path / "trace.jsonl"
     out_json = tmp_path / "out.json"
 
-    with patch.object(cli, "_open_orbbec", return_value=fake_cam), \
+    with patch.object(cli, "_open_camera", return_value=fake_cam), \
          patch.object(cli, "_wait_for_user", return_value=None), \
          patch.object(cli, "_read_arm_q", return_value=np.zeros(6)), \
          patch.object(cli, "_make_kinematics", return_value=fake_kin), \
@@ -188,7 +188,7 @@ def test_collect_samples_skips_when_no_marker_detected(tmp_path):
     trace_log = tmp_path / "trace.jsonl"
     out_json = tmp_path / "out.json"
 
-    with patch.object(cli, "_open_orbbec", return_value=fake_cam), \
+    with patch.object(cli, "_open_camera", return_value=fake_cam), \
          patch.object(cli, "_wait_for_user", return_value=None), \
          patch.object(cli, "_read_arm_q", return_value=np.zeros(6)), \
          patch.object(cli, "_make_kinematics", return_value=fake_kin), \
@@ -217,10 +217,7 @@ def test_collect_samples_skips_when_no_marker_detected(tmp_path):
 
 
 def test_collect_samples_dry_run_arm_unavailable(tmp_path):
-    """When the arm can't be read, _read_arm_q returns None and the
-    script falls back to a deterministic synthetic q (dry-run path).
-    The collected sample must still have a valid T_gripper2base.
-    """
+    """A real collection cannot use synthetic arm positions."""
     _install_pyrealsense_stub()
     from wrc_demo.scripts import calib_top_orbbec as cli
 
@@ -230,7 +227,7 @@ def test_collect_samples_dry_run_arm_unavailable(tmp_path):
     trace_log = tmp_path / "trace.jsonl"
     out_json = tmp_path / "out.json"
 
-    with patch.object(cli, "_open_orbbec", return_value=fake_cam), \
+    with patch.object(cli, "_open_camera", return_value=fake_cam), \
          patch.object(cli, "_wait_for_user", return_value=None), \
          patch.object(cli, "_read_arm_q", return_value=None), \
          patch.object(cli, "_make_kinematics", return_value=fake_kin), \
@@ -250,11 +247,8 @@ def test_collect_samples_dry_run_arm_unavailable(tmp_path):
             trace_log=trace_log,
             manual=True,
         )
-    assert len(samples) == 2
-    # Synthetic q seeds q[0]=0.30+0.05*i for sample i; FK returns a
-    # different T per call. Just check SE(3) and that the T's differ.
-    assert np.linalg.norm(samples[0].T_gripper2base[:3, 3]
-                          - samples[1].T_gripper2base[:3, 3]) > 1e-6
+    assert samples == []
+    assert trace_log.read_text().count('"reason": "no_arm_q"') == 2
 
 
 def test_diagnose_can_bus_detects_error_passive(monkeypatch):
@@ -390,7 +384,7 @@ def test_auto_mode_loop_moves_arm_and_captures(monkeypatch, tmp_path):
     safe_arm = _StubSafeArm()
     monkeypatch.setattr(cli, "_connect_arm_with_safety",
                         lambda prof: ((_StubKin(), safe_arm, safe_arm._arm), None))
-    monkeypatch.setattr(cli, "_open_orbbec", lambda *a, **kw: fake_cam)
+    monkeypatch.setattr(cli, "_open_camera", lambda *a, **kw: fake_cam)
     monkeypatch.setattr(cli, "_make_kinematics", lambda: _StubKin())
     monkeypatch.setattr(cli, "ArUcoSession",
                         lambda *a, **kw: fake_aruco)

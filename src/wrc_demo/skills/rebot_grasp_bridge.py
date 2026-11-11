@@ -37,6 +37,7 @@ import threading
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    import numpy as np
     from reBotArm_control_py.controllers import RebotArmEndPose
     from rebot_grasp.drivers.robot.grasp_driver import GraspDriver
     from ..safety.harness import SafetyHarness
@@ -76,6 +77,7 @@ class RebotGraspBridge:
         self._controller = controller
         self._grasp_driver = grasp_driver
         self._harness = harness
+        self.motion_error: str | None = None
 
     # ──────────────────────────── motion ────────────────────────────
 
@@ -98,53 +100,59 @@ class RebotGraspBridge:
         redirected to the grasp target, causing table collisions and
         empty grasps.
 
-        Returns ``True`` if motion succeeded, ``False`` if IK failed or
-        the motion timed out. The caller (``skill_grasp_object`` /
-        ``skill_pick_and_place``) raises :class:`SkillError` on
-        ``False`` for pregrasp and grasp; place ignores ``False`` (no
-        second chance to reposition a held object).
+        Returns ``True`` once the sender completes. The caller verifies
+        the physical endpoint separately using joint feedback.
 
         With ``harness`` set, calls ``begin_motion()`` first (e-stop +
         watchdog check) and ``end_motion()`` after; ``SafetyViolation`` from
         ``begin_motion`` propagates without invoking the controller.
         """
+        self.motion_error = None
         if self._harness is not None:
             self._harness.begin_motion()
         try:
-            ok = bool(
-                self._controller.move_to_traj(
-                    x, y, z, roll, pitch, yaw, duration=duration,
-                )
-            )
-            if ok:
-                self._wait_motion(duration)
+            if not self._controller.move_to_traj(
+                x, y, z, roll, pitch, yaw, duration=duration,
+            ):
+                self.motion_error = self._sdk_motion_error() or "SDK rejected trajectory"
+                return False
+
+            timeout = duration + 2.6
+            if not self._wait_motion(duration, timeout):
+                self.motion_error = self._sdk_motion_error()
+                if self.motion_error is None:
+                    self.motion_error = f"SDK send thread timed out after {timeout:.2f} s"
+                    cancel = getattr(self._controller, "cancel_trajectory", None)
+                    if callable(cancel):
+                        cancel()
+                return False
+            return True
         finally:
             if self._harness is not None:
                 self._harness.end_motion()
-        return ok
 
-    def _wait_motion(self, duration: float, extra: float = 0.6) -> None:
-        """Block until the SDK motion thread finishes.
+    def get_commanded_joints(self) -> np.ndarray | None:
+        read_target = getattr(self._controller, "get_commanded_joints", None)
+        return read_target() if callable(read_target) else None
 
-        Mirrors ``rebot_grasp/scripts/main.py::_wait_motion`` exactly:
-        join the controller's ``_send_thread`` with a generous timeout
-        so the arm has time to settle before the next command fires.
-        """
-        import time as _time
+    def _sdk_motion_error(self) -> str | None:
+        reason = getattr(self._controller, "motion_error", None)
+        return reason if isinstance(reason, str) else None
 
-        # Prefer the controller's own wait primitive when available
-        # (wrc_demo vendored SDK exposes ``wait_motion_done``).
+    def _wait_motion(self, duration: float, timeout: float) -> bool:
+        """Block until the SDK motion thread finishes."""
         wait_fn = getattr(self._controller, "wait_motion_done", None)
         if callable(wait_fn):
-            wait_fn(timeout=duration + extra + 2.0)
-            return
+            return bool(wait_fn(timeout=timeout))
 
-        # Fallback: join the send thread directly (rebot_grasp SDK).
         thread = getattr(self._controller, "_send_thread", None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=duration + extra + 2.0)
-        else:
-            _time.sleep(duration + extra)
+        if thread is not None:
+            thread.join(timeout=timeout)
+            return not thread.is_alive()
+
+        import time
+        time.sleep(duration + 0.6)
+        return True
 
     # ──────────────────────────── gripper ───────────────────────────
 

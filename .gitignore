@@ -150,6 +150,8 @@ activemq-data/
 # Environments
 .env
 .envrc
+/.kimi-code-api-key
+/.kimi-code-api-key.*
 .venv
 env/
 venv/
@@ -268,6 +270,11 @@ data/recordings/*.json
 # Local recalibration output goes to a *.local.json sidecar so the
 # private camera_serial never lands in git history again:
 data/calibration/hand_eye_top.local.json
+data/calibration/hand_eye_top.local.npz
+data/calibration/hand_eye_d435i.local.json
+data/calibration/hand_eye_d435i.local.npz
+data/calibration/hand_eye_d405.local.json
+data/calibration/hand_eye_d405.local.npz
 data/calibration/hand_eye_wrist.local.json
 
 # Blanket-ignore the bundled-models directory. The downloader script

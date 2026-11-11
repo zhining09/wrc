@@ -121,8 +121,10 @@ class RebotArmEndPose:
 
         self._traj: list[np.ndarray] = []
         self._moving = False
+        self._send_completed = True
         self._send_thread: Optional[threading.Thread] = None
         self._stop_send = threading.Event()
+        self.motion_error: str | None = None
 
         self._home_vel: float = 0.5
         self._vlim_override: Optional[np.ndarray] = None
@@ -276,6 +278,7 @@ class RebotArmEndPose:
         waypoint_hook: Optional[Callable[[np.ndarray], bool]] = None,
     ) -> bool:
         if not self._running:
+            self.motion_error = "controller is not running"
             return False
 
         q_start, _, _ = self.rebotarm.get_state()
@@ -291,7 +294,10 @@ class RebotArmEndPose:
             controlled_joints=self._n,
         )
         if not ik_result.success:
-            print(f"[RebotArmEndPose/Traj] IK 失败  err={ik_result.error:.4f}")
+            self.motion_error = (
+                f"SDK endpoint IK failed (residual={ik_result.error:.4g}, "
+                f"q_start={q_start[:self._n].round(5).tolist()} rad)"
+            )
             return False
 
         q_end = ik_result.q
@@ -314,23 +320,32 @@ class RebotArmEndPose:
             null_gain=0.1,
         )
         if not joint_traj:
-            print("[RebotArmEndPose/Traj] 轨迹为空")
+            self.motion_error = "SDK planned an empty joint trajectory"
             return False
 
         pts = [pt.q[: self._n].copy() for pt in joint_traj]
+        # Verify the six joints that will be sent, after CLIK and truncation.
+        q_last = pad_q_for_model(self._model, pts[-1], self._n)
+        xyz_last, rot_last, _ = compute_fk(self._model, q_last)
+        delta_mm = (xyz_last - T_target.translation) * 1000.0
+        rotation_error = np.linalg.norm(rot_last - T_target.rotation)
+        # Both IK stages normally converge to 1e-4. Allow their residuals
+        # to accumulate while guarding against a materially wrong endpoint.
+        if not (
+            joint_traj[-1].ik_success
+            and np.linalg.norm(delta_mm) <= 1.0
+            and rotation_error <= 1e-3
+        ):
+            self.motion_error = (
+                f"SDK trajectory endpoint rejected (CLIK converged="
+                f"{joint_traj[-1].ik_success}, XYZ delta="
+                f"{delta_mm.round(2).tolist()} mm, rotation matrix residual="
+                f"{rotation_error:.4g}, q_start={q_start[:self._n].round(5).tolist()} rad, "
+                f"q_planned={pts[-1].round(5).tolist()} rad)"
+            )
+            return False
 
-        self._stop_send.set()
-        if self._send_thread is not None:
-            self._send_thread.join(timeout=5.0)
-
-        self._traj = pts
-        self._moving = True
-        self._stop_send.clear()
-        self._send_thread = threading.Thread(
-            target=self._send_loop, args=(duration, waypoint_hook), daemon=True,
-        )
-        self._send_thread.start()
-        return True
+        return self._start_trajectory(pts, duration, waypoint_hook)
 
     def move_joints_traj(
         self,
@@ -364,14 +379,28 @@ class RebotArmEndPose:
         if not q_waypoints:
             return False
 
-        self._stop_send.set()
-        if self._send_thread is not None:
-            self._send_thread.join(timeout=5.0)
-
-        self._traj = [
+        pts = [
             np.asarray(q, dtype=np.float64)[: self._n].copy()
             for q in q_waypoints
         ]
+        return self._start_trajectory(pts, duration, waypoint_hook)
+
+    def _start_trajectory(
+        self,
+        pts: list[np.ndarray],
+        duration: float,
+        waypoint_hook: Optional[Callable[[np.ndarray], bool]],
+    ) -> bool:
+        self.cancel_trajectory()
+        if self._send_thread is not None:
+            self._send_thread.join(timeout=5.0)
+            if self._send_thread.is_alive():
+                self.motion_error = "previous SDK send thread is still running"
+                return False
+
+        self._traj = pts
+        self.motion_error = None
+        self._send_completed = False
         self._moving = True
         self._stop_send.clear()
         self._send_thread = threading.Thread(
@@ -380,18 +409,20 @@ class RebotArmEndPose:
         self._send_thread.start()
         return True
 
-    def wait_motion_done(self, timeout: float = 30.0) -> bool:
-        """Block until ``_moving`` clears (or timeout).
+    def cancel_trajectory(self) -> None:
+        """Stop advancing the trajectory and keep holding the current target."""
+        self._stop_send.set()
 
-        Returns True if motion completed, False on timeout.
-        ``SafetyViolation`` from a waypoint hook will clear ``_moving``
-        immediately (see ``_send_loop``), so this is the right primitive
-        for SafeArm.move_joints callers.
-        """
+    def get_commanded_joints(self) -> np.ndarray:
+        """Snapshot the joint target buffer read by the control loop."""
+        return self._q_target.copy()
+
+    def wait_motion_done(self, timeout: float = 30.0) -> bool:
+        """Wait for all waypoints to be sent. Return False on abort or timeout."""
         deadline = time.monotonic() + timeout
         while self._moving and time.monotonic() < deadline:
             time.sleep(0.01)
-        return not self._moving
+        return not self._moving and self._send_completed
 
     # ── 控制循环 ───────────────────────────────────────────────────────────
 
@@ -402,10 +433,9 @@ class RebotArmEndPose:
                 if self._use_gravity_ff:
                     q_now = self._arm_group.get_positions(request_feedback=False)
                     q_now = pad_q_for_model(self._model, q_now, self._n)
+                    # Use the calibrated URDF gravity directly, as in rebot_grasp.
                     tau_ff = compute_generalized_gravity(self._model, q_now, self._data)[: self._n]
-                    tau_ff[1] *= 1.55  # joint2 额外补偿
-                    tau_ff[2] *= 1.55  # joint3 额外补偿
-                    
+
                 self._arm_group.send_mit(
                     self._q_target,
                     vel=self._qd_target,
@@ -448,13 +478,19 @@ class RebotArmEndPose:
         """
         n = len(self._traj)
         interval = duration / n if n > 0 else self._dt
-        for i in range(n):
-            if self._stop_send.is_set():
-                self._moving = False
-                return
-            if hook is not None and not hook(self._traj[i]):
-                self._moving = False
-                return
-            self._q_target[:] = self._traj[i]
-            time.sleep(interval)
-        self._moving = False
+        try:
+            for i, waypoint in enumerate(self._traj):
+                if self._stop_send.is_set():
+                    self.motion_error = f"SDK trajectory cancelled before waypoint {i + 1}/{n}"
+                    return
+                if hook is not None and not hook(waypoint):
+                    self.motion_error = f"SDK waypoint {i + 1}/{n} was rejected"
+                    return
+                self._q_target[:] = waypoint
+                time.sleep(interval)
+            self._send_completed = True
+        except Exception as e:
+            self.motion_error = f"SDK send thread failed ({type(e).__name__}: {e})"
+            raise
+        finally:
+            self._moving = False

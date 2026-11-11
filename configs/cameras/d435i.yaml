@@ -1,5 +1,7 @@
 # Intel RealSense D435i (stereo). Works with stock pyrealsense2 wheels too.
 type: realsense
+device_model: D435i
+serial: null
 width: 1280
 height: 720
 fps: 30
@@ -9,9 +11,11 @@ warmup_frames: 15
 
 extrinsics:
   mode: eye_to_hand
-  # PLACEHOLDER: calibrate on the rig (see l515.yaml notes).
-  T:
-    - [ 0.0, -1.0,  0.0, 0.28]
-    - [-1.0,  0.0,  0.0, 0.00]
-    - [ 0.0,  0.0, -1.0, 0.60]
-    - [ 0.0,  0.0,  0.0, 1.00]
+  source: "${repo}/data/calibration/hand_eye_d435i.local.json"
+  hand_eye_compensation_m:
+    x: 0.00
+    y: 0.00
+    z: 0.00
+
+requires_calibration: true
+fuse_beliefs: true

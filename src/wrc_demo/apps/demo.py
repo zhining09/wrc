@@ -16,6 +16,7 @@ path without an LLM call; only novel tasks reach the model.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,8 @@ from ..agent.llm import make_llm
 from ..agent.orchestrator import AgentOrchestrator
 from ..agent.reflex import ExperienceMemory, FastPlanner
 from ..agent.trace import TraceLogger
-from ..config import CONFIG_DIR, Cfg, PACKAGE_ROOT, load_demo_config
+from ..config import Cfg, PACKAGE_ROOT, load_demo_config
+from ..config import resolve_llm_profile as _resolve_llm_profile
 from ..control import make_arm
 from ..memory import BeliefStore, EpisodicMemory
 from ..perception.camera_base import make_camera
@@ -35,32 +37,6 @@ from ..perception.stream import CameraRig, CameraStream
 from ..perception.world import LockedDetector, WatchedCamera, WorldWatcher
 from ..safety.harness import Kinematics, SafetyHarness, SafetyLimits
 from ..skills.runtime import SkillRuntime
-
-
-
-def _resolve_llm_profile(args_llm):
-    """Determine the effective LLM profile name.
-
-    Priority: CLI --llm (if provided) > demo.yaml llm.profile > "mock".
-
-    This lets users switch the demo's brain by editing one line of
-    configs/demo.yaml (e.g. ``profile: minimax`` for the cloud API)
-    instead of remembering the --llm CLI flag. CLI flag still wins
-    for ad-hoc overrides and tests.
-    """
-    if args_llm:
-        return args_llm
-    # Look up at call time so tests can monkeypatch wrc_demo.config.CONFIG_DIR
-    from .. import config as _config
-    demo_yaml_path = _config.CONFIG_DIR / "demo.yaml"
-    if demo_yaml_path.exists():
-        import yaml as _yaml
-        with open(demo_yaml_path) as f:
-            demo_yaml = _yaml.safe_load(f) or {}
-        profile = (demo_yaml.get("llm") or {}).get("profile")
-        if profile:
-            return str(profile)
-    return "mock"
 
 
 def _camera_cfgs(cfg) -> list[Cfg]:
@@ -83,12 +59,6 @@ def build_runtime(
         ee_frame=str(cfg.arm.get("ee_frame", "gripper_end")),
         arm_joint_count=int(cfg.arm.get("n_joints", 6)),
     )
-    # ``make_arm`` returns the right arm type (MockArm / SafeArm
-    # wrapping the vendored SDK) and connects it. For real arms this
-    # powers the motors immediately; the ``lazy_arm`` flag is now a
-    # no-op (kept in the signature for back-compat with the MCP server).
-    arm = make_arm(cfg, kinematics=kin)
-
     # ── the camera rig: N continuous streams, first = manipulation ──────
     cam_cfgs = _camera_cfgs(cfg)
     streams, watched = [], []
@@ -106,33 +76,35 @@ def build_runtime(
         return kin.fk(arm.get_state().q)
 
     for i, ccfg in enumerate(cam_cfgs):
+        extr_cfg = ccfg.get("extrinsics", _empty_cfg())
+        fuse = bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg))
+        if ccfg.get("requires_calibration", False):
+            source = extr_cfg.get("source")
+            legacy_source = extr_cfg.get("hand_eye_npz")
+            path = next((p for p in (source, legacy_source) if p and Path(p).is_file()), None)
+            real_primary = i == 0 and cfg.arm.type != "mock"
+            if not path:
+                message = f"Camera {ccfg.name!r} needs a hand-eye calibration at {source or legacy_source!r}"
+                if real_primary:
+                    raise ValueError(f"{message} before running with a real arm. Run wrc-calib-top first.")
+                print(f"[wrc-demo] {message}; fusing beliefs is disabled", file=sys.stderr)
+                fuse = False
+            elif real_primary and path == source:
+                serial = json.loads(Path(path).read_text()).get("camera_serial")
+                if serial and serial != "REDACTED":
+                    configured_serial = ccfg.get("serial")
+                    if configured_serial and str(configured_serial) != str(serial):
+                        raise ValueError(
+                            f"Camera {ccfg.name!r} is configured for serial {configured_serial!r}, "
+                            f"but {path} was calibrated for {serial!r}. Run wrc-calib-top again."
+                        )
+                    ccfg = Cfg({**ccfg.as_dict(), "serial": str(serial)})
         stream = CameraStream(
             make_camera(ccfg),
             name=str(ccfg.get("name", f"cam{i}")),
             rate_hz=float(ccfg.get("fps", 30.0)),
         )
         streams.append(stream)
-        # requires_calibration + no on-disk extrinsics -> force fuse=False.
-        # The strict loader above already returns identity T for missing
-        # files; this branch fails closed *before* WatchedCamera ever sees
-        # the camera, so 3D beliefs stay clean during bring-up.
-        requires_calib = bool(ccfg.get("requires_calibration", False))
-        extr_cfg = ccfg.get("extrinsics", _empty_cfg())
-        if requires_calib:
-            src_path = str(extr_cfg.get("source") or extr_cfg.get("hand_eye_npz") or "")
-            have_src = bool(src_path) and Path(str(src_path)).exists()
-            if not have_src:
-                print(
-                    f"[wrc-demo] {ccfg.get('name', f'cam{i}')}: "
-                    "requires_calibration=true but no extrinsics source "
-                    f"({src_path!r}); fusing beliefs is disabled for this camera",
-                    file=sys.stderr,
-                )
-                fuse = False
-            else:
-                fuse = bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg))
-        else:
-            fuse = bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg))
         watched.append(
             WatchedCamera(
                 stream=stream,
@@ -146,10 +118,12 @@ def build_runtime(
         )
     rig = CameraRig(streams)
     rig.open()
-    # Detector init AFTER camera open to avoid USB reset during YOLO/GPU load
-    detector = LockedDetector(_make_detector(cfg))
     try:
+        # Detector init AFTER camera open to avoid USB reset during YOLO/GPU load.
+        detector = LockedDetector(_make_detector(cfg))
         rig.primary.warm_up(int(cam_cfgs[0].get("warmup_frames", 5)))
+        # make_arm powers on a real arm after the camera is ready.
+        arm = make_arm(cfg, kinematics=kin)
     except Exception:
         rig.close()  # a partial build must not leak open camera streams
         raise
@@ -262,14 +236,14 @@ def _make_detector(cfg):
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="WRC agentic grasping demo")
     p.add_argument("--task", default=None, help="natural-language task")
-    p.add_argument("--camera", default="mock", help="camera profile (mock|l515|d435i|uvc)")
+    p.add_argument("--camera", help="camera profile (overrides demo.yaml camera.profile for a real arm)")
     p.add_argument("--cameras", default=None,
                    help="comma-separated camera profiles; first = manipulation "
                         "camera (e.g. l515,uvc). Overrides --camera.")
     p.add_argument("--arm", default="mock", help="arm profile (mock|rebot_rs)")
     p.add_argument("--llm", default=None,
                help="llm profile (overrides demo.yaml llm.profile); "
-                    "one of: mock|local_qwen3_vl|minimax|anthropic|openai")
+                    "filename stem from configs/llm/ (e.g. kimi_code or local_qwen3_vl)")
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--run-dir", default=None, help="trace output dir")
     p.add_argument("--interactive", action="store_true", help="multi-task REPL")
@@ -288,13 +262,14 @@ def main(argv: list[str] | None = None) -> int:
     import os
 
     view = not args.no_view and bool(os.environ.get("DISPLAY"))
-    print(f"[wrc-demo] cameras={cameras or [args.camera]} arm={args.arm} "
+    print(f"[wrc-demo] cameras={[cam.name for cam in _camera_cfgs(cfg)]} arm={args.arm} "
           f"llm={llm_profile} view={view}")
     print(f"[wrc-demo] traces -> {run_dir}")
 
+    llm = make_llm(cfg.llm)
     runtime, arm = build_runtime(cfg, run_dir, view=view, serve=not args.no_serve)
     if runtime.stream_server is not None:
-        print(f"[wrc-demo] LIVESTREAM dashboard: {runtime.stream_server.url}")
+        print(f"[wrc-demo] LIVESTREAM dashboard: {runtime.stream_server.local_url}")
 
     # Ctrl+C = soft stop (freeze + latch e-stop, no free-fall); a second
     # Ctrl+C raises KeyboardInterrupt and tears the process down.
@@ -308,7 +283,6 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _sigint)
     from ..agent.llm import MockLLM
 
-    llm = make_llm(cfg.llm)
     is_mock = isinstance(llm, MockLLM)
     advisor = Advisor(llm) if (llm.supports_vision and not is_mock) else None
     experience = ExperienceMemory(PACKAGE_ROOT / "runs" / "experience.json")

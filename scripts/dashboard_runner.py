@@ -51,7 +51,7 @@ from wrc_demo.config import load_demo_config
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Long-running wrc_demo runner")
-    p.add_argument("--cameras", default="mock",
+    p.add_argument("--cameras",
                    help="comma-separated camera profiles (first = manipulation)")
     p.add_argument("--arm", default="mock", help="arm profile (mock|rebot_rs)")
     p.add_argument("--llm", default=None,
@@ -92,8 +92,9 @@ def main() -> int:
                 llm_profile = "mock"
     print(f"LLM TIER: {llm_profile} (source: {'cli/demo-yaml' if args.llm else 'auto'})", flush=True)
 
-    cameras = [c.strip() for c in args.cameras.split(",")]
+    cameras = [c.strip() for c in args.cameras.split(",")] if args.cameras else None
     cfg = load_demo_config(cameras=cameras, arm=args.arm, llm=llm_profile)
+    print(f"CAMERAS: {[camera['name'] for camera in cfg.cameras]}", flush=True)
     # pastel cubes on RTX renders sit ~0.15; lower the threshold for the
     # booth setting where objects are typically uniform-colored.
     cfg._data["detector"]["conf"] = 0.12
@@ -103,12 +104,13 @@ def main() -> int:
         "banana", "cracker box", "soup can", "cube", "box", "bottle", "toy",
     ]
 
+    llm = make_llm(cfg.llm)
     runtime, arm = build_runtime(cfg, REPO / "runs" / "dashboard", view=False, serve=True)
-    print("DASHBOARD:", runtime.stream_server.url if runtime.stream_server else "OFF",
+    print("DASHBOARD:", runtime.stream_server.local_url if runtime.stream_server else "OFF",
           flush=True)
 
     agent = AgentOrchestrator(
-        make_llm(cfg.llm), runtime, decompose=False,
+        llm, runtime, decompose=False,
     )
 
     def run_task(task: str):

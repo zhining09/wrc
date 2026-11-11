@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot bring-up: vLLM + wrc_demo (interactive).
+# One-shot bring-up for wrc_demo, with vLLM for the local Qwen3-VL profile.
 #
 # Usage:
 #   bash scripts/start_all.sh                            # mock stack, no sudo
@@ -24,9 +24,8 @@
 # 0.27 are incompatible with the wrc_demo DM env (cu12, older stacks).
 # They talk via the OpenAI HTTP API on localhost:8080.
 #
-# Default profile is `local_qwen3_vl` (Qwen3-VL-2B-Instruct AWQ-4bit,
-# AWQ INT4 fits on 8 GB and natively supports tool calling). Override
-# with `--llm <profile>` after editing the DEMO_ARGS line below.
+# Use configs/demo.yaml llm.profile, or set WRC_LLM for a one-run override.
+# The local_qwen3_vl profile starts the bundled vLLM service when needed.
 #
 # See ADR-0007 / docs/SPEC-local-llm.md for details.
 
@@ -89,7 +88,6 @@ MODE="${1:-mock}"   # --real, --dashboard, mock, or first arg = task string
 shift || true
 TASK=""
 NEED_SUDO=0
-CAMERAS="mock"
 ARM="mock"
 LAUNCH_DASHBOARD=0
 REPL_MODE=""
@@ -97,7 +95,6 @@ REPL_MODE=""
 case "$MODE" in
     --real|real)
         NEED_SUDO=1
-        CAMERAS="orbbec_overhead"
         ARM="rebot_rs"
         # Accept "--real --dashboard" or "--real --repl" in either order.
         if [[ "${1:-}" == "--dashboard" ]]; then
@@ -115,7 +112,6 @@ case "$MODE" in
         LAUNCH_DASHBOARD=1
         if [[ "${1:-}" == "--real" ]]; then
             NEED_SUDO=1
-            CAMERAS="orbbec_overhead"
             ARM="rebot_rs"
             shift
         fi
@@ -131,7 +127,6 @@ case "$MODE" in
         # (mutual exclusion for --dashboard is checked below).
         if [[ "${1:-}" == "--real" ]]; then
             NEED_SUDO=1
-            CAMERAS="orbbec_overhead"
             ARM="rebot_rs"
             shift
         elif [[ "${1:-}" == "--dashboard" ]]; then
@@ -168,6 +163,23 @@ if [[ -n "${REPL_MODE:-}" && -n "$TASK" ]]; then
     exit 1
 fi
 
+# Pick a Python interpreter. Prefer $WRC_DEMO_PY; otherwise use the
+# conda `wrc-demo` env's python (the project's standard).  Do NOT
+# fall back to `command -v python` (PATH lookup) — that may resolve
+# to a user-installed `~/.local/bin/python` whose site-packages
+# shadow the conda env, breaking torch/ultralytics imports.
+WRC_DEMO_PY="${WRC_DEMO_PY:-/home/seeed/miniforge3/envs/wrc-demo/bin/python}"
+if [[ ! -x "$WRC_DEMO_PY" ]]; then
+    echo "  ERROR: $WRC_DEMO_PY not found. Set WRC_DEMO_PY or fix the hardcoded path."
+    exit 1
+fi
+
+LLM_PROFILE=$(PYTHONPATH="$REPO_DIR/src" "$WRC_DEMO_PY" -s -c '
+import sys
+from wrc_demo.config import resolve_llm_profile
+print(resolve_llm_profile(sys.argv[1]))
+' "${WRC_LLM:-}")
+
 # ── Step 0: ensure YOLOE text-encoder symlinks in CWD ─────────────────
 # ultralytics loads `mobileclip*.ts` from the current working directory
 # (NOT from models/). The launchers (start_all.sh, run.sh) all run
@@ -188,36 +200,41 @@ for _ts in mobileclip2_b.ts mobileclip_blt.ts; do
 done
 
 echo "============================================================"
-echo "  wrc_demo + Qwen3-VL-AWQ-4bit one-shot launcher"
+echo "  wrc_demo one-shot launcher"
 echo "============================================================"
 echo "  mode:    $([[ $NEED_SUDO -eq 1 ]] && echo 'real hardware' || echo 'mock stack')"
-echo "  camera:  $CAMERAS"
+echo "  camera:  $([[ $NEED_SUDO -eq 1 ]] && echo 'configs/demo.yaml (camera.profile)' || echo 'mock')"
 echo "  arm:     $ARM"
+echo "  llm:     $LLM_PROFILE"
 echo "  task:    ${TASK:-<interactive>}"
 echo ""
 
-# ── Step 1: ensure vLLM is running ───────────────────────────────
-echo "[1/3] check vLLM..."
-if curl -sf --max-time 3 http://localhost:8080/v1/models > /dev/null 2>&1; then
-    echo "  vLLM already running (skipped)"
+# ── Step 1: start vLLM for the bundled local profile ───────────────
+if [[ "$LLM_PROFILE" == "local_qwen3_vl" ]]; then
+    echo "[1/3] check vLLM..."
+    if curl -sf --max-time 3 http://localhost:8080/v1/models > /dev/null 2>&1; then
+        echo "  vLLM already running (skipped)"
+    else
+        echo "  vLLM not running, starting..."
+        # The legacy script name "start_cosmos3_server.sh" is preserved because
+        # operation docs and many user scripts reference it; it now serves the
+        # Qwen3-VL AWQ model (see ADR-0007 + §17/§18 of wrc_demo_操作文档.md).
+        MAX_LEN=8192 GPU_UTIL=0.85 bash "$VLLM_SCRIPT" --bg
+        # Wait for readiness
+        for i in {1..40}; do
+            sleep 3
+            if curl -sf --max-time 3 http://localhost:8080/v1/models > /dev/null 2>&1; then
+                echo "  vLLM ready (after ${i}*3s)"
+                break
+            fi
+            if [[ $i -eq 40 ]]; then
+                echo "  vLLM failed to start in 120s; see $VLLM_LOG"
+                exit 1
+            fi
+        done
+    fi
 else
-    echo "  vLLM not running, starting..."
-    # The legacy script name "start_cosmos3_server.sh" is preserved because
-    # operation docs and many user scripts reference it; it now serves the
-    # Qwen3-VL AWQ model (see ADR-0007 + §17/§18 of wrc_demo_操作文档.md).
-    MAX_LEN=8192 GPU_UTIL=0.85 bash "$VLLM_SCRIPT" --bg
-    # Wait for readiness
-    for i in {1..40}; do
-        sleep 3
-        if curl -sf --max-time 3 http://localhost:8080/v1/models > /dev/null 2>&1; then
-            echo "  vLLM ready (after ${i}*3s)"
-            break
-        fi
-        if [[ $i -eq 40 ]]; then
-            echo "  vLLM failed to start in 120s; see $VLLM_LOG"
-            exit 1
-        fi
-    done
+    echo "[1/3] skip local vLLM for $LLM_PROFILE"
 fi
 
 # ── Step 2: launch wrc_demo ─────────────────────────────────────
@@ -226,53 +243,25 @@ echo "[2/3] start wrc_demo..."
 RUN_DIR="${WRC_RUN_DIR:-$REPO_DIR/runs/live_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_DIR"
 
-# Pick a Python interpreter. Prefer $WRC_DEMO_PY; otherwise use the
-# conda `wrc-demo` env's python (the project's standard).  Do NOT
-# fall back to `command -v python` (PATH lookup) — that may resolve
-# to a user-installed `~/.local/bin/python` whose site-packages
-# shadow the conda env, breaking torch/ultralytics imports.
-WRC_DEMO_PY="${WRC_DEMO_PY:-/home/seeed/miniforge3/envs/wrc-demo/bin/python}"
-if [[ ! -x "$WRC_DEMO_PY" ]]; then
-    echo "  ERROR: $WRC_DEMO_PY not found. Set WRC_DEMO_PY or fix the hardcoded path."
-    exit 1
-fi
-
-
-# Build env-passthrough list for LLM API keys. The `env VAR=val cmd`
-# form below resets all environment variables; anything needed by
-# the subprocess must be listed explicitly. These match the `env_key:`
-# fields in configs/llm/*.yaml (see ADR-0006).
-_API_KEY_ARGS=()
-[[ -n "${MINIMAX_API_KEY:-}"   ]] && _API_KEY_ARGS+=(MINIMAX_API_KEY="$MINIMAX_API_KEY")
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] && _API_KEY_ARGS+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
-[[ -n "${OPENAI_API_KEY:-}"    ]] && _API_KEY_ARGS+=(OPENAI_API_KEY="$OPENAI_API_KEY")
-
-# Default LLM profile is local_qwen3_vl (current production model — Qwen3-VL-2B
-# AWQ-4bit served by start_cosmos3_server.sh). Override with --llm <profile>.
-# Build demo args as a bash array (preserves quoting of $TASK).
-# LLM profile resolution (priority high→low, see _resolve_llm_profile):
-#   1. `WRC_LLM` env var → pass as --llm (overrides everything)
-#   2. NOT passing --llm → falls through to configs/demo.yaml
-#   3. demo.yaml `llm.profile` (lowest priority)
-# This way the user can edit demo.yaml once and have it take effect.
+# Build demo arguments as an array to preserve quoting of $TASK.
 if [[ $LAUNCH_DASHBOARD -eq 1 ]]; then
     BOOT_TASK="${TASK:-${WRC_DASHBOARD_TASK:-pick and place pink object}}"
     DEMO_ARGS=(scripts/dashboard_runner.py \
-        --cameras "$CAMERAS" --arm "$ARM" \
+        --arm "$ARM" \
         --task "$BOOT_TASK")
 elif [[ -n "${REPL_MODE:-}" ]]; then
     # Foreground REPL: --interactive reads tasks from stdin (real terminal).
     # No --no-serve: the MJPEG stream dashboard stays up on :8090 so the
     # user can also watch the live view while typing.
     DEMO_ARGS=(-m wrc_demo.apps.demo \
-        --cameras "$CAMERAS" --arm "$ARM" --no-view --interactive)
+        --arm "$ARM" --no-view --interactive)
 else
     # Non-dashboard, non-REPL: run wrc_demo.apps.demo as a module. The
     # script name moved out of the nohup line (session 2 had dropped it)
     # and into DEMO_ARGS so the same nohup form works for both modules
     # and script-file invocations.
     DEMO_ARGS=(-m wrc_demo.apps.demo \
-        --cameras "$CAMERAS" --arm "$ARM" --no-view)
+        --arm "$ARM" --no-view)
     if [[ -n "$TASK" ]]; then
         DEMO_ARGS+=(--no-serve --task "$TASK")
     else
@@ -288,10 +277,7 @@ else
         exit 1
     fi
 fi
-# Only pass --llm if WRC_LLM is set; otherwise let demo.yaml decide.
-if [[ -n "${WRC_LLM:-}" ]]; then
-    DEMO_ARGS+=(--llm "$WRC_LLM")
-fi
+DEMO_ARGS+=(--llm "$LLM_PROFILE")
 
 # === Build env-prefix array (sudo or no-sudo) =========================
 # This used to be inlined into the nohup line and duplicated for sudo vs
@@ -321,15 +307,23 @@ if [[ $NEED_SUDO -eq 1 ]]; then
     done
     export LD_LIBRARY_PATH="${_LD_PATHS}${LD_LIBRARY_PATH:-}"
 
-    _SUFFIX_PRE=(sudo env HOME="$HOME" PYTHONNOUSERSITE=1 \
-        "${_API_KEY_ARGS[@]}" \
+    _SUDO_ARGS=(sudo)
+    _API_KEY_NAMES=()
+    for _key in MINIMAX_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY MOONSHOT_API_KEY KIMI_CODE_API_KEY; do
+        if [[ -n "${!_key:-}" ]]; then
+            _API_KEY_NAMES+=("$_key")
+        fi
+    done
+    if ((${#_API_KEY_NAMES[@]})); then
+        _SUDO_ARGS+=(--preserve-env="$(IFS=,; echo "${_API_KEY_NAMES[*]}")")
+    fi
+    _SUFFIX_PRE=("${_SUDO_ARGS[@]}" env HOME="$HOME" PYTHONNOUSERSITE=1 \
         YOLO_OFFLINE=True \
         PYTHONPATH="$REPO_DIR/src" \
         LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
         WRC_RUN_DIR="$RUN_DIR" WRC_STREAM=1 WRC_VIEW=1)
 else
     _SUFFIX_PRE=(env HOME="$HOME" PYTHONNOUSERSITE=1 \
-        "${_API_KEY_ARGS[@]}" \
         YOLO_OFFLINE=True \
         PYTHONPATH="$REPO_DIR/src" \
         WRC_RUN_DIR="$RUN_DIR")
@@ -379,7 +373,9 @@ echo "============================================================"
 echo "  ✓ READY"
 echo "============================================================"
 echo "  wrc_demo:    http://localhost:8090/  (dashboard, if --no-view not set)"
-echo "  vLLM:        http://localhost:8080/v1  (Qwen3-VL-2B-AWQ-4bit via start_cosmos3_server.sh)"
+if [[ "$LLM_PROFILE" == "local_qwen3_vl" ]]; then
+    echo "  vLLM:        http://localhost:8080/v1  (Qwen3-VL-2B-AWQ-4bit via start_cosmos3_server.sh)"
+fi
 echo "  log:         $DEMO_LOG"
 echo "  tail:        tail -f $DEMO_LOG"
 echo "  status:      bash $0 --status"

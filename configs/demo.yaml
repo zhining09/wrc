@@ -1,15 +1,23 @@
+
 # Main demo configuration. Camera/arm/llm profiles are merged in at load
 # time (see wrc_demo.config.load_demo_config).
 
+# Real hardware camera profile in configs/cameras/. Shared by wrc-calib-top
+# and the demo. Choose orbbec_overhead, d435i, or d405 to match the camera.
+camera:
+  profile: d405
+
 # Active LLM profile (CLI --llm overrides). Change to switch models; no
 # fallback cascade -- others edit this single field to pick their backend:
+#   kimi_code       -> Kimi Code API (needs KIMI_CODE_API_KEY)
+#   kimi            -> Kimi API Platform (needs MOONSHOT_API_KEY)
 #   local_qwen3_vl  -> local 4-bit Qwen3-VL via start_cosmos3_server.sh
 #   minimax         -> MiniMax cloud API (needs MINIMAX_API_KEY env var)
 #   anthropic       -> Anthropic Claude (needs ANTHROPIC_API_KEY env var)
 #   openai          -> OpenAI / OpenAI-compat (needs OPENAI_API_KEY)
 #   mock            -> scripted mock (offline / smoke test)
 llm:
-  profile: local_qwen3_vl
+  profile: kimi_code
 
 safety:
   # Base-frame workspace AABB for the TCP (meters). Verified against the RS
@@ -73,7 +81,7 @@ grasp:
   # relies on the 2 cm compensation alone, which gives the equivalent
   # of a 20 mm gripper-finger offset. Set to 0 here to match rebot_grasp;
   # raise if your gripper has a longer tip-to-TCP offset.
-  insertion_depth_m: 0.0    # matches rebot_grasp; see calibration file
+  insertion_depth_m: 0.02    # matches rebot_grasp; see calibration file
   depth_fraction: 0.35      # grasp this far down from the object's TOP. Low
                             # value = grasp near the top face, which keeps the
                             # gripper fingers (they extend ~5cm below the TCP)

@@ -6,13 +6,15 @@ trace files) with only the LLM decisions scripted.
 """
 
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
 from conftest import needs_pin
 
-from wrc_demo.agent.llm import LLMResponse, MockLLM, ToolCall
+from wrc_demo.agent.llm import LLMResponse, MockLLM, OpenAICompatClient, ToolCall
 from wrc_demo.agent.orchestrator import AgentOrchestrator
 
 
@@ -43,6 +45,50 @@ def runtime_and_arm(demo_cfg, tmp_path):
 
 def _script(*calls: ToolCall) -> list[LLMResponse]:
     return [LLMResponse(text="", tool_calls=[c]) for c in calls]
+
+
+@needs_pin
+def test_malformed_task_done_arguments_are_rejected_and_can_be_reissued(runtime_and_arm, monkeypatch):
+    runtime, _ = runtime_and_arm
+    skill = Mock(wraps=runtime.skill_task_done)
+    monkeypatch.setattr(runtime, "skill_task_done", skill)
+    llm = OpenAICompatClient("test-model", api_key="test-key", supports_vision=False)
+    arguments = [
+        '{"success":false,"summary":"Box depth',
+        "[]",
+        '{"success":false,"summary":"Box depth missing."}',
+    ]
+    requests = []
+
+    def chat_completion(kwargs):
+        requests.append(kwargs)
+        index = len(requests) - 1
+        tool = SimpleNamespace(
+            id=f"call_{index}",
+            function=SimpleNamespace(name="task_done", arguments=arguments[index]),
+        )
+        return SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[tool])),
+        ])
+
+    monkeypatch.setattr(llm, "_call_with_param_fallback", chat_completion)
+    report = AgentOrchestrator(llm, runtime, decompose=False, max_steps=3).run_task("test")
+
+    skill.assert_called_once_with(success=False, summary="Box depth missing.")
+    assert report.steps == 3
+    assert not report.success
+    records = [
+        json.loads(line)
+        for line in (runtime.trace.run_dir / "trace.jsonl").read_text().splitlines()
+    ]
+    for index in (0, 1):
+        assert records[index]["args"] == {"_raw": arguments[index]}
+        assert "expected a complete JSON object" in records[index]["result"]["error"]
+        replies = requests[index + 1]["messages"]
+        assert any(
+            msg.get("tool_call_id") == f"call_{index}" and "Reissue task_done" in msg["content"]
+            for msg in replies
+        )
 
 
 @needs_pin

@@ -201,7 +201,7 @@ class StreamServer:
             target=self._httpd.serve_forever, daemon=True, name="stream-server"
         )
         self._thread.start()
-        print(f"[stream] live view on {self.url}", file=sys.stderr)
+        print(f"[stream] live view on {self.local_url}", file=sys.stderr)
 
     def stop(self) -> None:
         self._stopping = True  # MJPEG handler loops watch this and exit
@@ -215,7 +215,13 @@ class StreamServer:
 
     @property
     def url(self) -> str:
-        return f"http://{lan_ip()}:{self.port}/"
+        host = lan_ip() if self._host == "0.0.0.0" else self._host
+        return f"http://{host}:{self.port}/"
+
+    @property
+    def local_url(self) -> str:
+        host = "127.0.0.1" if self._host == "0.0.0.0" else self._host
+        return f"http://{host}:{self.port}/"
 
     # ── rendering ────────────────────────────────────────────────────────
 

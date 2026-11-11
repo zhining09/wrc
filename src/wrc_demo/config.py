@@ -91,7 +91,7 @@ def load_profile(kind: str, name: str, config_dir: Path | None = None) -> Cfg:
 
 
 def load_demo_config(
-    camera: str = "mock",
+    camera: str | None = None,
     arm: str = "mock",
     llm: str = "mock",
     config_dir: Path | None = None,
@@ -106,6 +106,8 @@ def load_demo_config(
     cdir = Path(config_dir) if config_dir else CONFIG_DIR
     main = _resolve_paths(_load_yaml(cdir / "demo.yaml"), cdir)
     names = [n.strip() for n in (cameras or [camera]) if n and n.strip()]
+    if not names:
+        names = ["mock" if arm == "mock" else _real_camera_profile(main)]
     cams = []
     for i, name in enumerate(names):
         prof = load_profile("cameras", name, cdir).as_dict()
@@ -116,3 +118,23 @@ def load_demo_config(
     main["arm"] = load_profile("arms", arm, cdir).as_dict()
     main["llm"] = load_profile("llm", llm, cdir).as_dict()
     return Cfg(main)
+
+
+def _real_camera_profile(main: dict[str, Any]) -> str:
+    return (main.get("camera") or {}).get("profile") or "orbbec_overhead"
+
+
+def load_real_camera_profile_name() -> str:
+    return _real_camera_profile(_load_yaml(CONFIG_DIR / "demo.yaml"))
+
+
+def resolve_llm_profile(args_llm: str | None) -> str:
+    """Use the explicit profile, then demo.yaml's default, then mock."""
+    if args_llm:
+        return args_llm
+    path = CONFIG_DIR / "demo.yaml"
+    if path.exists():
+        profile = (_load_yaml(path).get("llm") or {}).get("profile")
+        if profile:
+            return str(profile)
+    return "mock"

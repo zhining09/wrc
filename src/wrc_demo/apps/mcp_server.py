@@ -11,7 +11,7 @@ dependency. stdout carries ONLY protocol frames; everything else goes to
 stderr.
 
 Configuration via environment (set in the MCP server entry):
-    WRC_CAMERA          camera profile (default: mock)
+    WRC_CAMERA          override the camera profile (demo.yaml for a real arm)
     WRC_CAMERAS         comma-separated camera profiles; first one is the
                         manipulation camera (overrides WRC_CAMERA)
     WRC_ARM             arm profile    (default: mock)
@@ -126,7 +126,7 @@ class McpSkillServer:
             cameras = [
                 c.strip()
                 for c in os.environ.get(
-                    "WRC_CAMERAS", os.environ.get("WRC_CAMERA", "mock")
+                    "WRC_CAMERAS", os.environ.get("WRC_CAMERA", "")
                 ).split(",")
                 if c.strip()
             ]

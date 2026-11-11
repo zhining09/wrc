@@ -14,7 +14,7 @@ warmup_frames: 15
 align_depth_to_color: true
 
 extrinsics:
-  source: "${repo}/data/calibration/hand_eye_top.json"   # 找不到时仅 warn, 不参与融合
+  source: "${repo}/data/calibration/hand_eye_top.local.json"
   mode: eye_to_hand
   # T 字段在 JSON loader 中读取后覆盖; 此处仅占位避免 schema 漂移
   T:
@@ -34,6 +34,6 @@ extrinsics:
 
 # 该 profile 表示一台必须经过 hand-eye 标定才允许 3D 融合的相机:
 # - 标定文件存在: fuse_beliefs 由 profile 显式设为 true
-# - 标定文件缺失: demo.py build_runtime() 会强制把 fuse_beliefs 降为 false 并 stderr warn
+# - 真机的主相机缺少标定文件时，启动会要求先完成标定。
 requires_calibration: true
 fuse_beliefs: true

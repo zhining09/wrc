@@ -12,15 +12,17 @@ bridge); these tests assert the bridge path is used when ``runtime.bridge``
 is set.
 """
 
+import json
 from unittest.mock import MagicMock, patch, call as mock_call
 
 import numpy as np
 import pinocchio as pin
 import pytest
 
+from wrc_demo.agent.trace import TraceLogger
 from wrc_demo.config import load_demo_config
 from wrc_demo.skills.runtime import SkillRuntime
-from wrc_demo.types import SkillError
+from wrc_demo.types import Detection, Frame, SkillError
 
 
 # ──────────────── helpers ────────────────
@@ -372,19 +374,45 @@ def test_pick_and_place_bridge_path_place_uses_hardcoded_z_0_08():
     assert place_call.kwargs["duration"] == 2.0
 
 
-def test_pick_and_place_bridge_path_returns_failure_if_no_box():
-    """If box not detected, raise SkillError before grasp."""
+@pytest.mark.parametrize(
+    ("box_detected", "reason"),
+    [
+        (False, "no detections for ['box']"),
+        (True, "detected 'box' but only 0 valid depth points (<10, conf=0.80, mask=64 px)"),
+    ],
+)
+def test_pick_and_place_bridge_traces_box_localization_failure(tmp_path, box_detected, reason):
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
+    rt.beliefs.find.return_value = None
+    rt.extrinsics.cam_to_base.return_value = np.eye(4)
+    rt.trace = TraceLogger(tmp_path)
 
-    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, None])
-    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+    banana_mask = np.zeros((16, 16), dtype=bool)
+    banana_mask[:8, :8] = True
+    box_mask = np.zeros((16, 16), dtype=bool)
+    box_mask[8:, 8:] = True
+    frame = Frame(
+        rgb=np.zeros((16, 16, 3), dtype=np.uint8),
+        depth_m=np.where(banana_mask, 0.3, 0.0),
+        K=np.eye(3),
+        frame_id=42,
+        depth_source="sensor",
+    )
+    rt.observe.return_value = frame
+    rt.detector.detect.side_effect = [
+        [Detection("banana", 0.9, np.array([0, 0, 8, 8]), mask=banana_mask)],
+        [Detection("box", 0.8, np.array([8, 8, 16, 16]), mask=box_mask)] if box_detected else [],
+    ]
 
-    with pytest.raises(SkillError, match="yellow box"):
-        rt.skill_pick_and_place("banana", destination="yellow box")
-
-    # Bridge.grasp NOT called (we never reached the grasp stage)
+    result = rt.execute("pick_and_place", {"object": "banana", "destination": "box"})
+    assert result == {
+        "ok": False,
+        "error": f"SkillError: localize 'box' failed: {reason} (frame_id=42, depth_source=sensor)",
+    }
+    trace = json.loads((tmp_path / "trace.jsonl").read_text())
+    assert trace["result"] == result
+    bridge.move_to_traj.assert_not_called()
     bridge.grasp.assert_not_called()
 
 

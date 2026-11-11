@@ -403,7 +403,7 @@ cd models/qwen3-vl-2b-awq-4bit && git lfs pull
 
 ## 5. 手眼标定
 
-标定的目的是让 demo 知道**像素坐标** ↔ **机器人基坐标系** 的变换。`data/clip`/hand_eye_top.json` 是脱敏参考矩阵，**你的相机必须重新标定**。
+标定的目的是让 demo 知道**像素坐标** ↔ **机器人基坐标系** 的变换。`data/calibration/hand_eye_top.json` 是脱敏参考矩阵。请在 `configs/demo.yaml` 的 `camera.profile` 选择 `orbbec_overhead`（Gemini 2）、`d435i`（D435i）或 `d405`（D405），再为当前相机标定。
 
 ### 5.1 准备
 
@@ -415,10 +415,9 @@ cd models/qwen3-vl-2b-awq-4bit && git lfs pull
 
 #### 2. 相机连接 + CAN bus
 
-```bash
-# Orbbec 插 USB 3.0，赋予相机权限
-sudo chmod a+rw /dev/bus/usb/*/*
+用 USB 3 连接相机，按对应 SDK 的说明配置 USB 设备权限。
 
+```bash
 # CAN bus（机械臂）
 sudo ip link set can0 down 2>/dev/null
 sudo ip link set can0 type can bitrate 1000000
@@ -429,11 +428,11 @@ sudo ip link set can0 up
 
 ```bash
 wrc-calib-top --list
-# 预期：列出 Orbbec 设备索引 + 序列号
+# 预期：列出所选相机型号的设备索引和序列号
 
 #写入相机序列号
-wrc-calib-top --bind top --serial `xxxx`
-# 将 serial `xxxx`中的内容更改为列出的相机序列号
+wrc-calib-top --bind top --serial YOUR_CAMERA_SERIAL
+# 将 YOUR_CAMERA_SERIAL 替换为列表中的设备序列号
 
 ```
 
@@ -443,15 +442,13 @@ wrc-calib-top --bind top --serial `xxxx`
 
 ```bash
 # 自动模式（按预设姿态自动跑 25+ 个采样点）
-wrc-calib-top --marker-size 0.10 --n 30 \
-  --out data/calibration/hand_eye_top.local.json
+wrc-calib-top --marker-size 0.10 --n 30
 
 # 手动模式（每次按 ENTER 采样）
-wrc-calib-top --marker-size 0.10 --manual --n 30 \
-  --out data/calibration/hand_eye_top.local.json
+wrc-calib-top --marker-size 0.10 --manual --n 30
 ```
 
-`hand_eye_top.local.json` 文件**自动被 .gitignore 忽略**（不会污染仓库），是真机标定结果。
+结果默认写入当前相机的 `extrinsics.source`。Gemini 2 默认用 `hand_eye_top.local.json`，D435i 默认用 `hand_eye_d435i.local.json`，D405 默认用 `hand_eye_d405.local.json`。
 
 :::tip
 因为本demo设定有机械臂的安全工作区域，如果在大面积区域在抓取放置问题时出现IK求解失败，那么则需要调整相机的固定位置并重新进行标定（稳定的相机固定位置在距离机械臂底座36cm*36cm的位置左右）
@@ -466,15 +463,15 @@ wrc-calib-top --marker-size 0.10 --manual --n 30 \
 输出：
 
 - `data/calibration/hand_eye_top.json` — 脱敏参考矩阵（**不要用**，serial=REDACTED）
-- `data/calibration/hand_eye_top.local.json` — **你的真机标定结果**
+- `data/calibration/hand_eye_top.local.json` 、`data/calibration/hand_eye_d435i.local.json` 或 `data/calibration/hand_eye_d405.local.json` — 对应相机的实测结果
 
 ### 5.3 验证标定 RMSE
 
-不重标定，直接用已知基坐标系点验证：
+用已知基坐标系点验证，将 `--npz` 后的路径换成当前相机的标定结果。
 
 ```bash
 wrc-calib-top --verify \
-  --json data/calibration/hand_eye_top.local.json \
+  --npz data/calibration/hand_eye_top.local.json \
   --known-points "0.30,0.00,0.02;0.25,-0.05,0.02;0.35,0.05,0.02"
 # 预期：RMSE < 10 mm（参考 set.py:320）
 ```
@@ -520,14 +517,16 @@ vLLM 0.6+ 已支持 Qwen3-VL 的多模态推理。AWQ-4bit 量化版本在 8 GB 
 | `anthropic.yaml` | Claude | `type: anthropic`、`model: claude-sonnet-5` |
 | `openai.yaml` | OpenAI / OpenAI 兼容 | `type: openai_compat`、`base_url`、`model` |
 | `minimax.yaml` | MiniMax | `type: openai_compat` + 固定 `base_url: https://api.minimax.chat/v1` + `env_key: MINIMAX_API_KEY` |
-| `local_qwen3_vl.yaml` | 本地 vLLM（默认）| 不需要 key |
+| `kimi_code.yaml` | Kimi Code（默认） | `type: openai_compat`、`env_key: KIMI_CODE_API_KEY` |
+| `kimi.yaml` | Kimi 开放平台 K2.6 | `type: openai_compat`、`env_key: MOONSHOT_API_KEY` |
+| `local_qwen3_vl.yaml` | 本地 vLLM | 不需要 key |
 | `mock.yaml` | scripted mock | 测试用 |
 
 #### b. 选哪个 profile（`configs/demo.yaml`）
 
 ```yaml
 llm:
-  profile: local_qwen3_vl    # ← 改这一行（mock / anthropic / openai / minimax / local_qwen3_vl）
+  profile: kimi_code    # ← 改成所选 YAML 的文件名（不含 .yaml）
 ```
 
 CLI 临时切：`wrc-demo --llm anthropic --task "..."`
@@ -539,6 +538,8 @@ CLI 临时切：`wrc-demo --llm anthropic --task "..."`
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openai` | `OPENAI_API_KEY`（`OPENAI_BASE_URL` 改 endpoint）|
 | `minimax` | `MINIMAX_API_KEY`（从 YAML 的 `env_key:` 字段读）|
+| `kimi_code` | `KIMI_CODE_API_KEY` |
+| `kimi` | `MOONSHOT_API_KEY`（从 YAML 的 `env_key:` 字段读）|
 | `local_qwen3_vl` | 不需要 |
 
 #### 跑起来
@@ -616,6 +617,10 @@ wrc-demo --llm local_qwen3_vl --task "go to home" --no-view --no-serve
 
 ### 7.1 启动 demo
 
+在 `configs/demo.yaml` 中设置 `camera.profile`。顶部 Gemini 2 选 `orbbec_overhead`，顶部 RealSense D435i 选 `d435i`，近距离固定安装的 D405 选 `d405`。D405 的理想深度工作距离为 7–50 cm。设备序列号、采集参数和标定路径在对应的 `configs/cameras/<profile>.yaml` 中。三个配置均可用 `wrc-calib-top --list` 查看序列号，再用 `wrc-calib-top --bind top --serial YOUR_CAMERA_SERIAL` 绑定设备。运行 `wrc-calib-top` 后，默认将标定结果保存到所选相机的 `extrinsics.source`。已有 Conda 环境缺少 SciPy 时，先运行 `python -m pip install scipy`。
+
+一键启动和 `wrc-demo --arm rebot_rs` 都使用这个相机设置。直接运行 `wrc-demo` 时，可用 `--camera` 临时覆盖。首次使用默认的 Kimi Code 后端前，在仓库根目录运行 `bash scripts/setup_kimi_code_key.sh` 保存密钥（见 §8.1）。
+
 ```bash
 # 启动项目
 bash /home/seeed/wrc/scripts/start_all.sh --repl --real
@@ -631,7 +636,7 @@ bash /home/seeed/wrc/scripts/start_all.sh --repl --real
   wrc_demo + Qwen3-VL-AWQ-4bit one-shot launcher
 ============================================================
   mode:    real hardware
-  camera:  orbbec_overhead
+  camera:  configs/demo.yaml (camera.profile)
   arm:     rebot_rs
   task:    <interactive>
 
@@ -712,70 +717,27 @@ skill_close_gripper	     # 关闭夹爪
 
 ### 8.1 加新 LLM profile
 
-wrc-demo 的 LLM 后端是**可插拔的**，如果您需要增加新的 LLM profile，`configs/llm/<name>.yaml` 一个文件,就是一个 profile。
+`--llm <名称>` 读取 `configs/llm/<名称>.yaml`，并覆盖 `configs/demo.yaml` 中的 `llm.profile`。Kimi Code 支持保存项目内密钥。使用其他后端时，在运行演示的终端导出对应密钥，再传入所选 profile 的名称。
 
-`demo.yaml` 里改一行 `profile: <name>` 就切换
+默认的 `configs/llm/kimi_code.yaml` 通过 Kimi Code 中国站调用 `kimi-for-coding`。请在 Kimi Code 控制台创建密钥。开放平台的 `kimi` 配置使用独立的 `MOONSHOT_API_KEY`。 [Kimi Code API 配置](https://www.kimi.com/code/docs/)
 
-**当前内置的 5 个 profile**:
+在仓库根目录运行下列命令并输入密钥，输入内容不会显示。密钥保存在仓库根目录的 `.kimi-code-api-key`，文件权限为 `600`，已加入 Git 忽略列表。此后从新终端启动同一份 WRC 会自动读取。已导出的 `KIMI_CODE_API_KEY` 优先。更换密钥时重新运行同一条命令。
 
-| profile | 用途 | 需要的 env var |
-|---|---|---|
-| `local_qwen3_vl` | **默认**,本地 Qwen3-VL-2B-AWQ-4bit(vLLM 8080) | 不需要 |
-| `mock` | 离线脚本,纯测试(§7.4 排查用过) | 不需要 |
-| `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY` |
-| `openai` | OpenAI / OpenAI 兼容协议 | `OPENAI_API_KEY` |
-| `minimax` | MiniMax cloud(已迁到 env var) | `MINIMAX_API_KEY` 
-
-如果需要加新 profile 可以执行下面几个步骤
-
-#### 第 1 步:复制 yaml 当模板
-
-（1）大多数国产 LLM(DeepSeek / Moonshot Kimi / DashScope Qwen / 智谱 / SiliconFlow)，都走 OpenAI Chat Completions 协议
-
-可以从 openai.yaml 复制
 ```bash
-cp configs/llm/openai.yaml configs/llm/kimi.yaml
+bash scripts/setup_kimi_code_key.sh
 ```
 
-（2）Anthropic 协议的从 anthropic.yaml 复制
+用模拟相机和机械臂验证。
 
-#### 第 2 步:改 yaml 的 4 个字段
-打开 configs/llm/kimi.yaml,只需要改 4 个字段:
-
-```
-type: openai                # 协议类型(见下方"type 怎么选")
-model: moonshot-v1-8k       # 模型名(查厂商文档)
-base_url: https://api.moonshot.cn/v1   # API endpoint,**末尾 /v1 不要漏**
-env_key: MOONSHOT_API_KEY   # 读哪个 env var
-supports_vision: false      # 是否支持图像(关键,见下方)
-temperature: 0.0            # 一般不用动
-max_tokens: 1024            # 一般不用动
-timeout_s: 30               # 慢网络可调到 60
-```
-
-#### 第 3 步:在 demo.yaml 切换 profile
-打开 `configs/demo.yaml`,找到 llm: block,只改一行:
-```
-llm:
-  profile: kimi    # ← 改成新 profile 名(去掉 .yaml 后缀)
-```
-
-#### 第 4 步:设 env var + 验证
-（1）临时 export(本次 shell 有效)
-```
-export MOONSHOT_API_KEY=sk-...
-```
-（2）验证 env var 生效
-```
-echo "${MOONSHOT_API_KEY:0:8}"
-```
-（3）用 --llm flag 试跑,**不动 demo.yaml**
-```
+```bash
 conda activate wrc-demo
-python -m wrc_demo.apps.demo --llm kimi --task "list the objects" --no-view --no-serve
+wrc-demo --camera mock --arm mock --llm kimi_code \
+  --task "Survey the workspace and report the objects you find." --no-view --no-serve
 ```
 
-（4）看 stdout 是否打印 "[wrc-demo] llm=kimi"，LLM 响应一条消息就算成功(空场景也 OK)
+任务报告出现 `path: llm` 和 `success: True`，说明模型完成了这次 Mock 任务。一键脚本也读取 `llm.profile`。使用 `kimi_code` 时跳过本机 vLLM，使用 `WRC_LLM=local_qwen3_vl` 时按需启动本机服务。
+
+接入其他 OpenAI Chat Completions 兼容服务时，可以复制 `configs/llm/openai.yaml` 为新文件，使用 `type: openai_compat`，将 `base_url` 设置为供应商提供的 API 根地址，并填写 `model`、`env_key` 和 `supports_vision`。`env_key` 填环境变量的名称。所选模型需要支持工具调用。
 
 
 ### 8.2 改 grasp 精度
@@ -807,7 +769,7 @@ grasp pose 要经过 `T_cam2base` 把相机坐标转到基坐标系——这一�
 ```yaml
 # configs/cameras/orbbec_overhead.yaml
 extrinsics:
-  source: "${repo}/data/calibration/hand_eye_top.json"
+  source: "${repo}/data/calibration/hand_eye_top.local.json"
   mode: eye_to_hand
   hand_eye_compensation_m:    # 米;默认 [0, 0, 0] = identity(不起作用)
     x: 0.00

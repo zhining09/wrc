@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..config import Cfg
+from ..config import Cfg, PACKAGE_ROOT
 
 
 @dataclass
@@ -86,11 +86,11 @@ class OpenAICompatClient(LLMClient):
         api_key: str | None = None,
         supports_vision: bool = True,
         temperature: float = 0.2,
+        extra_body: dict[str, Any] | None = None,
     ):
         import os
 
-        import httpx
-        from openai import OpenAI
+        from openai import DefaultHttpxClient, OpenAI
 
         # Local servers (llama.cpp/vLLM) need a dummy key; hosted endpoints
         # fall through to the OPENAI_API_KEY environment variable.
@@ -103,13 +103,14 @@ class OpenAICompatClient(LLMClient):
         # httpx client disables env-var-driven proxy detection. The
         # endpoint URL itself is already explicit via base_url, so we
         # never want a proxy for direct-API calls.
-        proxy_bypass_http = httpx.Client(trust_env=False)
+        proxy_bypass_http = DefaultHttpxClient(trust_env=False)
         self._client = OpenAI(
             base_url=base_url, api_key=api_key, http_client=proxy_bypass_http
         )
         self.model = model
         self.supports_vision = supports_vision
         self.temperature = temperature
+        self.extra_body = extra_body
 
     def chat(self, system, messages, tools=None, max_tokens=1024) -> LLMResponse:
         oai_msgs: list[dict] = [{"role": "system", "content": system}]
@@ -162,6 +163,8 @@ class OpenAICompatClient(LLMClient):
             max_tokens=max_tokens,
             temperature=self.temperature,
         )
+        if self.extra_body is not None:
+            kwargs["extra_body"] = self.extra_body
         if tools:
             kwargs["tools"] = [
                 {"type": "function", "function": t} for t in tools
@@ -172,10 +175,15 @@ class OpenAICompatClient(LLMClient):
         choice = resp.choices[0].message
         calls = []
         for tc in choice.tool_calls or []:
+            raw = tc.function.arguments
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(raw or "{}")
             except json.JSONDecodeError:
-                args = {"_raw": tc.function.arguments}
+                args = None
+            if not isinstance(args, dict):
+                # Preserve the invalid input for the trace. The runtime
+                # reports an argument error before invoking the skill.
+                args = {"_raw": raw}
             calls.append(ToolCall(name=tc.function.name, arguments=args, id=tc.id))
         # choice.reasoning is set by vLLM with --reasoning-parser qwen3;
         # getattr guards against the OpenAI SDK Message class not exposing
@@ -350,13 +358,21 @@ def make_llm(cfg: Cfg) -> LLMClient:
             # Default to OPENAI_API_KEY for backward compatibility with profiles
             # that pre-date ADR-0006 (no env_key declared).
             _api_key = _os.environ.get("OPENAI_API_KEY")
+        if not _api_key and _env_var == "KIMI_CODE_API_KEY":
+            try:
+                _api_key = (PACKAGE_ROOT / ".kimi-code-api-key").read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                pass
         if _env_var and not _api_key:
             # ADR-0006: profile declares env_key but env is unset → misconfig,
             # surface at startup not at chat time.
+            hint = f"export {_env_var}=<your-key> before launching"
+            if _env_var == "KIMI_CODE_API_KEY":
+                hint = "run bash scripts/setup_kimi_code_key.sh from the WRC checkout"
             raise LLMConfigError(
                 profile_name=cfg.get("profile") or cfg.get("name"),
                 env_key=_env_var,
-                hint=f"export {_env_var}=<your-key> before launching",
+                hint=hint,
             )
         return OpenAICompatClient(
             model=cfg.model,
@@ -364,5 +380,6 @@ def make_llm(cfg: Cfg) -> LLMClient:
             api_key=_api_key or "EMPTY",
             supports_vision=bool(cfg.get("supports_vision", True)),
             temperature=float(cfg.get("temperature", 0.2)),
+            extra_body=cfg.as_dict().get("extra_body"),
         )
     raise ValueError(f"unknown llm type {kind!r} (mock|anthropic|openai_compat)")

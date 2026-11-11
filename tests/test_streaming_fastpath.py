@@ -207,12 +207,12 @@ def test_stream_server_serves_state_snapshot_and_index():
     server.start()
     try:
         rig.warm_up(2)
-        base = f"http://127.0.0.1:{server.port}"
-        state = json.loads(urllib.request.urlopen(f"{base}/state", timeout=5).read())
+        assert server.local_url == f"http://127.0.0.1:{server.port}/"
+        state = json.loads(urllib.request.urlopen(f"{server.local_url}state", timeout=5).read())
         assert state["agent_status"] == "testing" and "over" in state["cameras"]
-        jpeg = urllib.request.urlopen(f"{base}/snapshot/over.jpg", timeout=5).read()
+        jpeg = urllib.request.urlopen(f"{server.local_url}snapshot/over.jpg", timeout=5).read()
         assert jpeg[:2] == b"\xff\xd8"  # JPEG magic
-        html = urllib.request.urlopen(f"{base}/", timeout=5).read().decode()
+        html = urllib.request.urlopen(server.local_url, timeout=5).read().decode()
         assert "/stream/over" in html and "robot narration" in html
     finally:
         server.stop()

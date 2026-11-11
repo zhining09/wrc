@@ -41,7 +41,7 @@ import pytest
 
 from wrc_demo.grasping.camera_grasp import plan_grasp_from_mask
 from wrc_demo.perception.grounding import Extrinsics
-from wrc_demo.config import load_demo_config
+from wrc_demo.config import Cfg
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -126,9 +126,8 @@ REPLAY_APPROACH_TOL_M = 1.5e-2  # ~1° on tool-x direction
 @pytest.fixture(scope="module")
 def T_cam2base() -> np.ndarray:
     """The rebot_grasp T_cam2base, mirrored into wrc_demo's
-    ``hand_eye_top.json`` (the file the runtime reads at boot)."""
-    cfg = load_demo_config(camera="orbbec_overhead", arm="rebot_rs", llm="mock")
-    ext = Extrinsics.from_config(cfg.camera.extrinsics)
+    checked-in ``hand_eye_top.json`` reference."""
+    ext = Extrinsics.from_config(Cfg({"source": str(REPO / "data/calibration/hand_eye_top.json")}))
     return ext.cam_to_base()
 
 
@@ -185,7 +184,7 @@ def _make_synthetic_scene(run: CapturedRun, K: np.ndarray):
     ),
     strict=False,
 )
-def test_recorded_object_backprojects_consistently(orbbec_K):
+def test_recorded_object_backprojects_consistently(orbbec_K, T_cam2base):
     """Sanity check: the captured ``position_xyz`` matches what the
     captured pixel + depth + K back-project to. If this fails, the
     recorded run used a different K or coordinate convention than what
@@ -200,13 +199,9 @@ def test_recorded_object_backprojects_consistently(orbbec_K):
         # verify the geometric invariant: T_cam2base @ cam_pos projects
         # to the recorded grasp within 5 mm. (If the K or convention
         # changed, this would diverge.)
-        cfg = load_demo_config(
-            camera="orbbec_overhead", arm="rebot_rs", llm="mock"
-        )
-        T = Extrinsics.from_config(cfg.camera.extrinsics).cam_to_base()
         T_cam = np.eye(4)
         T_cam[:3, 3] = cam_pos
-        proj = (T @ T_cam)[:3, 3]
+        proj = (T_cam2base @ T_cam)[:3, 3]
         # Without insertion, the projected position should land at z > grasp_z.
         # The exact offset depends on the compensation (baked-in here);
         # just check the projected z is close to the recorded grasp z.

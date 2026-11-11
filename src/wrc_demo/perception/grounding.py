@@ -292,13 +292,10 @@ def localize_object(
     from .colors import color_matches, detection_color
 
     T_cam2base = extrinsics.cam_to_base()
-    if vocab:
-        rounds = [(vocab, "vocabulary")]
-    else:
-        rounds = [([p], p) for p in (prompts or [label])]
+    rounds = [vocab] if vocab else [[prompt] for prompt in (prompts or [label])]
 
     last_reason = f"no detections for {vocab or prompts or [label]}"
-    for classes, what in rounds:
+    for classes in rounds:
         dets = [d for d in detector.detect(frame, classes=classes) if d.conf > 0]
         if not dets:
             continue
@@ -320,8 +317,9 @@ def localize_object(
             pts_cam = mask_to_points_cam(frame, mask)
             if pts_cam.shape[0] < min_points:
                 last_reason = (
-                    f"detected {what!r} but only {pts_cam.shape[0]} valid depth "
-                    f"points (<{min_points}); object may be out of depth range"
+                    f"detected {det.label!r} but only {pts_cam.shape[0]} valid depth "
+                    f"points (<{min_points}, conf={det.conf:.2f}, "
+                    f"{'mask' if det.mask is not None else 'bbox'}={np.count_nonzero(mask)} px)"
                 )
                 continue
             pts_base = transform_points(T_cam2base, pts_cam)

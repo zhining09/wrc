@@ -17,6 +17,8 @@ def fake_controller() -> MagicMock:
     """Mock for reBotArm_control_py.controllers.RebotArmEndPose."""
     ctrl = MagicMock()
     ctrl.move_to_traj.return_value = True
+    ctrl.wait_motion_done.return_value = True
+    ctrl.motion_error = None
     return ctrl
 
 
@@ -55,6 +57,16 @@ def test_move_to_traj_returns_false_when_ik_fails(bridge, fake_controller):
     fake_controller.move_to_traj.return_value = False
     ok = bridge.move_to_traj(0.25, 0.0, 0.35, 0.0, 1.2, 0.0, duration=2.0)
     assert ok is False
+    fake_controller.wait_motion_done.assert_not_called()
+
+
+def test_move_to_traj_timeout_cancels_sender(bridge, fake_controller):
+    fake_controller.wait_motion_done.return_value = False
+
+    assert not bridge.move_to_traj(0.25, 0.0, 0.35, 0.0, 1.2, 0.0, duration=2.0)
+    fake_controller.wait_motion_done.assert_called_once_with(timeout=4.6)
+    fake_controller.cancel_trajectory.assert_called_once_with()
+    assert "timed out" in bridge.motion_error
 
 
 def test_open_gripper_calls_driver_without_timeout(bridge, fake_driver):

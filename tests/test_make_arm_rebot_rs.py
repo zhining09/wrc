@@ -13,7 +13,11 @@ These tests monkeypatch the heavy SDK imports so they run without
 real hardware.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
 
 from wrc_demo.config import load_demo_config
 
@@ -91,3 +95,58 @@ def test_mock_arm_grasp_bridge_is_none():
     arm = make_arm(cfg, kinematics=MagicMock())
     # The MockArm backend doesn't get a bridge; attribute may be absent or None
     assert getattr(arm, "grasp_bridge", None) is None
+
+
+@pytest.fixture
+def sdk_controller():
+    from reBotArm_control_py.controllers import RebotArmEndPose
+
+    q = np.array([0.0, 0.1684, 0.6226, -0.4543, 0.0, 0.0])
+    arm = SimpleNamespace(
+        groups={"arm": SimpleNamespace(num_joints=6)},
+        has_gripper=False,
+        get_state=lambda: (q, np.zeros(6), np.zeros(6)),
+    )
+    controller = RebotArmEndPose(arm, arm_control_mode="mit")
+    controller._running = True
+    return controller
+
+
+def test_sdk_rejects_wrong_planned_endpoint_before_sending(sdk_controller):
+    point = SimpleNamespace(q=sdk_controller.rebotarm.get_state()[0], ik_success=True)
+    with patch(
+        "reBotArm_control_py.controllers.rebotarm_endpose_controller.track_trajectory",
+        return_value=[point],
+    ):
+        assert not sdk_controller.move_to_traj(0.3, 0.0, 0.3, pitch=0.7)
+
+    assert "trajectory endpoint rejected" in sdk_controller.motion_error
+    assert sdk_controller._send_thread is None
+
+
+def test_sdk_reports_sender_abort_and_recovers_on_next_motion(sdk_controller):
+    q = np.full(6, 0.1)
+    assert sdk_controller.move_joints_traj([q], 0.01, waypoint_hook=lambda _: False)
+    assert not sdk_controller.wait_motion_done(timeout=1.0)
+    assert "waypoint 1/1 was rejected" in sdk_controller.motion_error
+
+    assert sdk_controller.move_joints_traj([q], 0.01)
+    assert sdk_controller.wait_motion_done(timeout=1.0)
+    assert sdk_controller.motion_error is None
+    np.testing.assert_array_equal(sdk_controller.get_commanded_joints(), q)
+
+
+def test_sdk_rs_gravity_feedforward_matches_reference_at_pregrasp(sdk_controller):
+    q = np.array([0.68724, 1.99002, 2.02146, -1.48877, 0.15302, 0.65503])
+    group = sdk_controller._arm_group
+    group.get_positions = MagicMock(return_value=q)
+    group._mit_kp = np.array([50.0, 150.0, 150.0, 50.0, 50.0, 50.0])
+    group._mit_kd = np.array([3.0, 10.0, 10.0, 5.0, 4.0, 4.0])
+    group.send_mit = MagicMock()
+
+    sdk_controller._loop_cb(sdk_controller.rebotarm, dt=0.002)
+
+    # Gravity torques from the rebot_grasp RS URDF at this recorded pose.
+    group.send_mit.assert_called_once()
+    torque = group.send_mit.call_args.kwargs["tau"]
+    np.testing.assert_allclose(torque[1:3], [-8.57182, 5.14226], atol=1e-5)

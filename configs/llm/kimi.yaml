@@ -1,0 +1,10 @@
+# Moonshot Kimi API (China). YOLOE provides scene observations locally.
+type: openai_compat
+base_url: https://api.moonshot.cn/v1
+model: kimi-k2.6
+env_key: MOONSHOT_API_KEY
+supports_vision: false
+temperature: 0.6
+extra_body:
+  thinking:
+    type: disabled
